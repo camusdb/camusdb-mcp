@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+
+    env:
+      # Point the integration tests at the CamusDB container's REST/JSON port and require the
+      # server to be up — an unreachable server fails the suite instead of silently skipping,
+      # so regressions like the SHOW TABLES column-name bug cannot pass unnoticed.
+      CAMUS_MCP_ENDPOINT: http://localhost:5095
+      CAMUS_MCP_DEFAULT_DATABASE: test
+      CAMUS_MCP_REQUIRE_SERVER: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Start CamusDB
+        # 5095 = REST/JSON API (used by CamusDB.Client's default transport and the integration tests).
+        run: docker run -d -p 5095:5095 -p 5096:5096 -v camus-data:/data --name camusdb camusdb/camusdb:latest
+
+      - name: Wait for CamusDB to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://localhost:5095/ping >/dev/null 2>&1; then
+              echo "CamusDB is up after ${i}s."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CamusDB did not become ready in time." >&2
+          docker logs camusdb || true
+          exit 1
+
+      - name: Create test database
+        run: |
+          curl --fail --silent -X POST http://localhost:5095/create-db \
+            -H "Content-Type: application/json" \
+            -d '{"databaseName":"test","ifNotExists":true}'
+
+      - name: Restore
+        run: dotnet restore camusdb-mcp.sln
+
+      - name: Build
+        run: dotnet build camusdb-mcp.sln --no-restore -c Release
+
+      - name: Test
+        # The suite talks to a single shared CamusDB instance; running test collections
+        # serially avoids transient DDL/sequence contention between concurrent classes.
+        run: >
+          dotnet test camusdb-mcp.sln
+          --no-build -c Release
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory TestResults
+          -- xUnit.ParallelizeTestCollections=false
+
+      - name: Dump CamusDB logs on failure
+        if: failure()
+        run: docker logs camusdb || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: ignore
+
+      - name: Stop CamusDB
+        if: always()
+        run: docker rm -f camusdb || true
