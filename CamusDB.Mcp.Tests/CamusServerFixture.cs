@@ -18,6 +18,11 @@ namespace CamusDB.Mcp.Tests;
 /// REST/JSON port used by the CI Docker container and the local dev server), and the target
 /// database from <c>CAMUS_MCP_DEFAULT_DATABASE</c> (default <c>test</c>).
 ///
+/// Credentials come from the same environment variables the server itself reads
+/// (<c>CAMUS_MCP_USER</c> / <c>CAMUS_MCP_PASSWORD</c> / <c>CAMUS_MCP_ACCESS_TOKEN</c>), so the one
+/// suite runs unchanged against both an unauthenticated server and one started with
+/// <c>CAMUSDB_AUTH_ENABLED=true</c>. With none set, no credentials are sent.
+///
 /// Reachability is probed once at startup with a context-free <c>SHOW DATABASES</c>. When the
 /// server is not running (e.g. a plain <c>dotnet test</c> on a dev box with no CamusDB), the
 /// integration tests skip themselves via <see cref="Available"/> rather than failing, so the
@@ -50,11 +55,9 @@ public sealed class CamusServerFixture : IAsyncLifetime
         string endpoint = Environment.GetEnvironmentVariable("CAMUS_MCP_ENDPOINT") ?? "http://localhost:5095";
         Database = Environment.GetEnvironmentVariable("CAMUS_MCP_DEFAULT_DATABASE") ?? "test";
 
-        Config = new McpConfig
-        {
-            BaseConnectionString = $"Endpoint={endpoint}",
-            DefaultDatabase = Database,
-        };
+        Config = McpConfig.FromEnvironment();
+        Config.BaseConnectionString = $"Endpoint={endpoint}";
+        Config.DefaultDatabase = Database;
         Client = new CamusClient(Config);
 
         try
