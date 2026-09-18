@@ -2,24 +2,12 @@
 
 `CamusDB.Mcp` is a standalone [Model Context Protocol](https://modelcontextprotocol.io) server
 that exposes a running CamusDB cluster to MCP-capable AI clients — Claude Desktop, Claude Code,
-and any other MCP host. It speaks MCP over **stdio** and lets an assistant explore and drive
+Codex and any other MCP host. It speaks MCP over **stdio** and lets an assistant explore and drive
 CamusDB through a small, typed tool surface instead of hand-rolling requests.
 
 It depends on **only one** CamusDB package: the published
-[`CamusDB.Client`](https://www.nuget.org/packages/CamusDB.Client) provider (0.9.3). There is no
-dependency on `CamusDB.Core` and no project reference to the engine — the server talks to CamusDB
+[`CamusDB.Client`](https://www.nuget.org/packages/CamusDB.Client). The server talks to CamusDB
 exclusively through the client's connection/command/reader API.
-
-## How it works
-
-Each tool call opens a short-lived `CamusConnection` (autocommit — no transaction is carried
-between calls) scoped to the requested database and issues the statement through the real client
-API: reader queries for reads, non-query execution for DML/DDL, and the client's dedicated
-`CreateDatabaseAsync` / `ShowBranchesAsync` entry points where they exist. Rows are read out of
-`CamusDataReader` column by column into plain `Dictionary<string, object?>` maps.
-
-Read tools classify the SQL locally (see [Security](#read-only-vs-mutating-boundary)) before any
-statement reaches the server.
 
 ## Prerequisites
 
