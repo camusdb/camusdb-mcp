@@ -43,11 +43,48 @@ public sealed class TestStatementGuard
     }
 
     [Fact]
+    public void AssertReadOnly_AllowsDescribe()
+    {
+        StatementGuard.AssertReadOnly("DESCRIBE users");
+        StatementGuard.AssertReadOnly("desc users");
+        StatementGuard.AssertReadOnly("SHOW CREATE TABLE users");
+        StatementGuard.AssertReadOnly("SHOW STATISTICS FOR TABLE users");
+    }
+
+    [Theory]
+    [InlineData("SELECT nextval('order_seq')")]
+    [InlineData("SELECT setval('order_seq', 1)")]
+    [InlineData("select NEXTVAL ('order_seq')")]
+    [InlineData("SELECT \"setval\"('order_seq', 1)")]
+    [InlineData("SELECT setval/**/('order_seq', 1)")]
+    [InlineData("SELECT '/*', setval('order_seq', 1), '*/'")]
+    public void AssertReadOnly_RejectsSequenceWrites(string sql)
+    {
+        CamusException ex = Assert.Throws<CamusException>(() => StatementGuard.AssertReadOnly(sql));
+        Assert.Equal("CADB0400", ex.Code);
+    }
+
+    [Fact]
+    public void AssertReadOnly_AllowsSequenceReadsAndLookalikeNames()
+    {
+        StatementGuard.AssertReadOnly("SELECT currval('order_seq')");
+        StatementGuard.AssertReadOnly("SELECT lastval()");
+        StatementGuard.AssertReadOnly("SELECT my_nextval(1) FROM t");
+        StatementGuard.AssertReadOnly("SELECT nextval_count FROM t");
+    }
+
+    [Fact]
+    public void AssertExplain_RejectsSequenceWrites()
+    {
+        Assert.Throws<CamusException>(() => StatementGuard.AssertExplain("EXPLAIN SELECT nextval('order_seq')"));
+    }
+
+    [Fact]
     public void AssertReadOnly_RejectsInsert()
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("INSERT INTO users (name) VALUES ('Alice')"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -55,7 +92,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("UPDATE users SET name = 'Bob' WHERE id = '1'"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -63,7 +100,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("DELETE FROM users WHERE id = '1'"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -71,7 +108,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("DROP TABLE users"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -79,7 +116,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("CREATE TABLE foo (id oid PRIMARY KEY)"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -87,7 +124,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("CREATE DATABASE mydb"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     // -------------------------------------------------------------------------
@@ -99,7 +136,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("/* SELECT */ INSERT INTO users (name) VALUES ('x')"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -107,7 +144,7 @@ public sealed class TestStatementGuard
     {
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("-- SELECT everything\nINSERT INTO users (name) VALUES ('x')"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     [Fact]
@@ -124,7 +161,7 @@ public sealed class TestStatementGuard
         // "SELECTED" is not "SELECT": the maximal leading identifier must be matched whole.
         CamusException ex = Assert.Throws<CamusException>(() =>
             StatementGuard.AssertReadOnly("SELECTED FROM users"));
-        Assert.Contains("select_query only accepts SELECT and SHOW", ex.Message);
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
     }
 
     // -------------------------------------------------------------------------

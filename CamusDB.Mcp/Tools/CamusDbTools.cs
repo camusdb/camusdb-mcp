@@ -30,6 +30,24 @@ public sealed record ListTablesResult(string[] Tables);
 /// <summary>Result of <c>list_branches</c>: one row per branch of the queried root database.</summary>
 public sealed record ListBranchesResult(Dictionary<string, object?>[] Branches);
 
+/// <summary>Result of <c>list_ancestors</c>: one row per ancestor of the queried branch database.</summary>
+public sealed record ListAncestorsResult(Dictionary<string, object?>[] Ancestors);
+
+/// <summary>
+/// Result of <c>list_views</c>: the plain view names, and one row per materialized view with its
+/// populated flag and last refresh time.
+/// </summary>
+public sealed record ListViewsResult(string[] Views, Dictionary<string, object?>[] MaterializedViews);
+
+/// <summary>Result of <c>list_sequences</c>: one row per sequence in a database.</summary>
+public sealed record ListSequencesResult(Dictionary<string, object?>[] Sequences);
+
+/// <summary>Result of <c>show_create</c>: the object's name and the DDL statement that recreates it.</summary>
+public sealed record ShowCreateResult(string Name, string Ddl);
+
+/// <summary>Result of <c>get_table_statistics</c>: one row per statistics target, discriminated by <c>kind</c>.</summary>
+public sealed record GetTableStatisticsResult(Dictionary<string, object?>[] Statistics);
+
 /// <summary>Result of <c>list_indexes</c>: one row per readable index on a table.</summary>
 public sealed record ListIndexesResult(Dictionary<string, object?>[] Indexes);
 
@@ -61,7 +79,7 @@ public sealed class ColumnDefinition
     [Description("Column name (valid SQL identifier).")]
     public string Name { get; set; } = "";
 
-    [Description("SQL type: oid, int64, float64, float32, string(N), bool, bytes, date, datetime, uuid.")]
+    [Description(CamusDbTools.AcceptedTypesDescription)]
     public string Type { get; set; } = "";
 
     [Description("If true, this column is part of the PRIMARY KEY.")]
@@ -70,10 +88,10 @@ public sealed class ColumnDefinition
     [Description("If true, adds a NOT NULL constraint.")]
     public bool NotNull { get; set; }
 
-    [Description("If true, creates a secondary index on this column.")]
+    [Description("If true, creates a secondary index on this column (as a table-level KEY ix_<table>_<column>).")]
     public bool Index { get; set; }
 
-    [Description("If true and Index is true, the secondary index is UNIQUE.")]
+    [Description("If true, the column gets a UNIQUE constraint (a unique secondary index). Index need not also be set.")]
     public bool Unique { get; set; }
 
     [Description("SQL default value expression (e.g. '0', 'true', \"'hello'\"). Null means no default.")]
@@ -93,9 +111,24 @@ public sealed class ColumnDefinition
 [McpServerToolType]
 public sealed class CamusDbTools
 {
-    private static readonly Regex StringTypeRegex = new(@"^string\(\d+\)$", RegexOptions.IgnoreCase);
-    private static readonly HashSet<string> ScalarTypes = new(StringComparer.OrdinalIgnoreCase)
-        { "oid", "object_id", "int64", "float64", "float32", "bool", "bytes", "date", "datetime", "uuid" };
+    /// <summary>The type list shown to the client in the <c>create_table</c> descriptions and errors.</summary>
+    internal const string AcceptedTypesDescription =
+        "SQL type: oid, int64, float64, float32, numeric, string, string(N), bool, bytes, bytes(N), date, " +
+        "datetime, uuid, array(T) for a scalar T, or serial. Aliases: object_id; int, smallint; float, real; " +
+        "decimal; varchar, char, text (also sized); boolean; blob (also sized); timestamp; guid; bigserial. " +
+        "numeric has a fixed precision of 38 and scale of 9 and takes no (p, s) arguments.";
+
+    // Mirrors field_type in the CamusDB grammar (plus the SERIAL / BIGSERIAL shorthand), so a type
+    // the server would parse is accepted here and anything else is refused before SQL composition.
+    // The type text is interpolated into the CREATE TABLE statement, so this match is also what keeps
+    // it from carrying anything but a type.
+    private const string ScalarTypePattern =
+        "oid|object_id|int64|int|smallint|float64|float32|float|real|bool|boolean|date|datetime|timestamp|" +
+        "uuid|guid|numeric|decimal|(?:string|varchar|char|text|bytes|blob)(?:\\s*\\(\\s*\\d+\\s*\\))?";
+
+    private static readonly Regex ColumnTypeRegex = new(
+        $"^(?:(?:{ScalarTypePattern})|array\\s*\\(\\s*(?:{ScalarTypePattern})\\s*\\)|serial|bigserial)\\z",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     // -------------------------------------------------------------------------
     // Read tools
@@ -142,9 +175,8 @@ public sealed class CamusDbTools
         CancellationToken ct)
     {
         IdentifierValidator.Validate(database, "database");
-        IReadOnlyList<CamusBranchRow> branches = await camus.ShowBranchesAsync(database, ct).ConfigureAwait(false);
-        Dictionary<string, object?>[] rows = branches.Select(BranchToRow).ToArray();
-        return new ListBranchesResult(rows);
+        QueryResult result = await camus.QueryAsync(database, $"SHOW BRANCHES FROM {database}", null, 0, ct).ConfigureAwait(false);
+        return new ListBranchesResult([.. result.Rows.Select(BranchToRow)]);
     }
 
     /// <summary>Lists all readable indexes on a table.</summary>
@@ -177,19 +209,117 @@ public sealed class CamusDbTools
         return new GetTableSchemaResult([.. result.Rows]);
     }
 
+    /// <summary>Lists the ancestors of a branch database.</summary>
+    [McpServerTool]
+    [Description("List the ancestors of a branch database: its parent, grandparent and so on up to the root (depth 1 = immediate parent). Returns an empty list for a root database.")]
+    public static async Task<ListAncestorsResult> ListAncestors(
+        CamusClient camus,
+        [Description("Branch database name whose ancestors to list.")] string database,
+        CancellationToken ct)
+    {
+        IdentifierValidator.Validate(database, "database");
+        QueryResult result = await camus.QueryAsync(database, $"SHOW ANCESTORS FROM {database}", null, 0, ct).ConfigureAwait(false);
+        return new ListAncestorsResult([.. result.Rows.Select(AncestorToRow)]);
+    }
+
+    /// <summary>Lists the views and materialized views in a database.</summary>
+    [McpServerTool]
+    [Description("List the views and materialized views in a database. Each materialized view reports whether it is populated and when it was last refreshed.")]
+    public static async Task<ListViewsResult> ListViews(
+        CamusClient camus,
+        [Description("Database name.")] string database,
+        CancellationToken ct)
+    {
+        IdentifierValidator.Validate(database, "database");
+        QueryResult views = await camus.QueryAsync(database, "SHOW VIEWS", null, 0, ct).ConfigureAwait(false);
+        QueryResult materialized = await camus.QueryAsync(database, "SHOW MATERIALIZED VIEWS", null, 0, ct).ConfigureAwait(false);
+
+        string[] names = views.Rows
+            .Select(r => GetStringField(r, "views", "view"))
+            .Where(n => n.Length > 0)
+            .ToArray();
+        return new ListViewsResult(names, [.. materialized.Rows]);
+    }
+
+    /// <summary>Lists the sequences in a database.</summary>
+    [McpServerTool]
+    [Description("List the sequences in a database with their options (start_value, increment, min_value, max_value, cache, owned_by, comment). reserved_upto is an upper bound on the values issued so far, not the last value.")]
+    public static async Task<ListSequencesResult> ListSequences(
+        CamusClient camus,
+        [Description("Database name.")] string database,
+        CancellationToken ct)
+    {
+        IdentifierValidator.Validate(database, "database");
+        QueryResult result = await camus.QueryAsync(database, "SHOW SEQUENCES", null, 0, ct).ConfigureAwait(false);
+        return new ListSequencesResult([.. result.Rows]);
+    }
+
+    /// <summary>Returns the DDL statement that recreates a table, view, materialized view or sequence.</summary>
+    [McpServerTool]
+    [Description("Get the DDL statement that recreates an object (SHOW CREATE TABLE / VIEW / MATERIALIZED VIEW / SEQUENCE). Kind is 'table' (default), 'view', 'materialized_view' or 'sequence'.")]
+    public static async Task<ShowCreateResult> ShowCreate(
+        CamusClient camus,
+        [Description("Database name.")] string database,
+        [Description("Object name.")] string name,
+        [Description("Object kind: 'table' (default), 'view', 'materialized_view' or 'sequence'.")] string? kind = null,
+        [Description("Tables only: if true, omits the secondary indexes (SHOW CREATE TABLE ... WITHOUT INDEXES). The primary key is always included.")] bool withoutIndexes = false,
+        CancellationToken ct = default)
+    {
+        IdentifierValidator.Validate(database, "database");
+        IdentifierValidator.Validate(name, "name");
+
+        string sql = (kind?.Trim().ToLowerInvariant() ?? "table") switch
+        {
+            "" or "table" => withoutIndexes ? $"SHOW CREATE TABLE {name} WITHOUT INDEXES" : $"SHOW CREATE TABLE {name}",
+            "view" => $"SHOW CREATE VIEW {name}",
+            "materialized_view" or "materialized view" => $"SHOW CREATE MATERIALIZED VIEW {name}",
+            "sequence" => $"SHOW CREATE SEQUENCE {name}",
+            _ => throw new CamusException("CADB0400",
+                $"Unknown object kind '{kind}'. Accepted: table, view, materialized_view, sequence."),
+        };
+
+        QueryResult result = await camus.QueryAsync(database, sql, null, 0, ct).ConfigureAwait(false);
+        if (result.Rows.Count == 0)
+            throw new CamusException("CADB0400", $"SHOW CREATE returned no row for '{name}'.");
+
+        // The DDL column is named after the statement ("Create Table", "create view", ...), so it is
+        // found by its prefix rather than by one fixed name.
+        Dictionary<string, object?> row = result.Rows[0];
+        string ddl = row
+            .Where(kv => kv.Key.StartsWith("create", StringComparison.OrdinalIgnoreCase))
+            .Select(kv => kv.Value?.ToString() ?? "")
+            .FirstOrDefault() ?? "";
+        return new ShowCreateResult(name, ddl);
+    }
+
+    /// <summary>Returns the optimizer statistics for a table.</summary>
+    [McpServerTool]
+    [Description("Get the optimizer statistics for a table (SHOW STATISTICS FOR TABLE): one row per target, discriminated by 'kind' (table counters, per-column estimates, composite-key estimates, per-index entry counts). Columns that do not apply to a row's kind are null. Check last_analyzed before trusting the values; run ANALYZE out of band to refresh them.")]
+    public static async Task<GetTableStatisticsResult> GetTableStatistics(
+        CamusClient camus,
+        [Description("Database name.")] string database,
+        [Description("Table name.")] string table,
+        CancellationToken ct)
+    {
+        IdentifierValidator.Validate(database, "database");
+        IdentifierValidator.Validate(table, "table");
+        QueryResult result = await camus.QueryAsync(database, $"SHOW STATISTICS FOR TABLE {table}", null, 0, ct).ConfigureAwait(false);
+        return new GetTableStatisticsResult([.. result.Rows]);
+    }
+
     // -------------------------------------------------------------------------
     // Query tools
     // -------------------------------------------------------------------------
 
     /// <summary>Executes a read-only SELECT or SHOW statement.</summary>
     [McpServerTool]
-    [Description("Execute a SELECT or SHOW statement. Mutating statements (INSERT, UPDATE, DELETE, DROP, CREATE) are rejected before execution. Results are capped at max_rows (default 1000).")]
+    [Description("Execute a SELECT, SHOW or DESCRIBE statement. Mutating statements (INSERT, UPDATE, DELETE, DROP, CREATE) are rejected before execution. Results are capped at max_rows (default 1000). NUMERIC values are returned as their exact decimal text. Parameters may be JSON scalars or arrays of scalars (bound as array parameters).")]
     public static async Task<SelectQueryResult> SelectQuery(
         CamusClient camus,
         McpConfig config,
         [Description("Database name (required for table queries; may be empty for SHOW DATABASES).")] string? database,
-        [Description("SQL SELECT or SHOW statement to execute.")] string sql,
-        [Description("Named parameters referenced in the SQL with @name placeholders. Values are JSON scalars.")] Dictionary<string, JsonElement>? parameters = null,
+        [Description("SQL SELECT, SHOW or DESCRIBE statement to execute.")] string sql,
+        [Description("Named parameters referenced in the SQL with @name placeholders. Values are JSON scalars or arrays of scalars. A number with more than 15 significant digits binds as an exact NUMERIC.")] Dictionary<string, JsonElement>? parameters = null,
         [Description("Maximum rows to return (default 1000, hard cap).")] int? maxRows = null,
         CancellationToken ct = default)
     {
@@ -203,12 +333,12 @@ public sealed class CamusDbTools
 
     /// <summary>Executes an EXPLAIN statement to get the query plan.</summary>
     [McpServerTool]
-    [Description("Execute an EXPLAIN statement. Mode can be 'plan' (default), 'logical', or 'physical'. If the sql argument already starts with EXPLAIN, it is forwarded as-is; otherwise EXPLAIN is prepended. EXPLAIN ANALYZE on joins is unsupported and surfaces as a tool error.")]
+    [Description("Execute an EXPLAIN statement. Mode can be 'plan' (default), 'logical', 'physical', or 'analyze'. If the sql argument already starts with EXPLAIN, it is forwarded as-is; otherwise EXPLAIN is prepended. 'analyze' runs the SELECT and reports measured per-operator statistics; it is unsupported on joins and on a FROM-less SELECT, and surfaces as a tool error there.")]
     public static async Task<ExplainQueryResult> ExplainQuery(
         CamusClient camus,
         [Description("Database name.")] string database,
         [Description("SQL to explain (SELECT statement or full EXPLAIN statement).")] string sql,
-        [Description("Plan mode: 'plan' (default), 'logical', or 'physical'.")] string? mode = null,
+        [Description("Plan mode: 'plan' (default), 'logical', 'physical', or 'analyze'.")] string? mode = null,
         CancellationToken ct = default)
     {
         string keyword = StatementGuard.AssertExplain(sql);
@@ -220,11 +350,12 @@ public sealed class CamusDbTools
         }
         else
         {
-            // CamusDB grammar: EXPLAIN (LOGICAL) / EXPLAIN (PHYSICAL) / EXPLAIN
+            // CamusDB grammar: EXPLAIN (LOGICAL) / EXPLAIN (PHYSICAL) / EXPLAIN (ANALYZE) / EXPLAIN
             string prefix = mode?.ToLowerInvariant() switch
             {
                 "logical" => "EXPLAIN (LOGICAL)",
                 "physical" => "EXPLAIN (PHYSICAL)",
+                "analyze" => "EXPLAIN (ANALYZE)",
                 _ => "EXPLAIN",
             };
             explainSql = $"{prefix} {sql}";
@@ -254,7 +385,7 @@ public sealed class CamusDbTools
 
     /// <summary>Creates a new table from a typed column definition list.</summary>
     [McpServerTool]
-    [Description("Create a new table. Columns are specified as a typed list; identifiers are validated before SQL composition. Accepted types: oid, int64, float64, float32, string(N), bool, bytes, date, datetime, uuid.")]
+    [Description("Create a new table. Columns are specified as a typed list; identifiers and types are validated before SQL composition. Accepted types: oid, int64, float64, float32, numeric, string, string(N), bool, bytes, bytes(N), date, datetime, uuid, array(T) for a scalar T, serial (an int64 identity column), and their SQL aliases.")]
     public static async Task<CreateTableResult> CreateTable(
         CamusClient camus,
         [Description("Database name.")] string database,
@@ -274,6 +405,10 @@ public sealed class CamusDbTools
         sb.Append(name);
         sb.Append(" (");
 
+        // CamusDB has no column-level INDEX constraint: a non-unique secondary index is a table-level
+        // KEY <name> (<column>) item, appended after the columns.
+        List<string> indexedColumns = [];
+
         for (int i = 0; i < columns.Count; i++)
         {
             ColumnDefinition col = columns[i];
@@ -290,7 +425,7 @@ public sealed class CamusDbTools
             {
                 if (col.NotNull) sb.Append(" NOT NULL");
                 if (col.Unique) sb.Append(" UNIQUE");
-                else if (col.Index) sb.Append(" INDEX");
+                else if (col.Index) indexedColumns.Add(col.Name);
             }
 
             if (col.Default is not null)
@@ -299,6 +434,17 @@ public sealed class CamusDbTools
                 sb.Append(col.Default);
                 sb.Append(')');
             }
+        }
+
+        foreach (string column in indexedColumns)
+        {
+            string indexName = $"ix_{name}_{column}";
+            IdentifierValidator.Validate(indexName, "index name");
+            sb.Append(", KEY ");
+            sb.Append(indexName);
+            sb.Append(" (");
+            sb.Append(column);
+            sb.Append(')');
         }
 
         sb.Append(')');
@@ -390,14 +536,17 @@ public sealed class CamusDbTools
 
     private static string ParamName(int rowIndex, string column) => $"r{rowIndex}_{column}";
 
-    private static void ValidateSqlType(string type)
+    /// <summary>
+    /// Validates a <c>create_table</c> column type against the types the CamusDB grammar accepts.
+    /// Throws <see cref="CamusException"/> with code <c>CADB0400</c> for anything else.
+    /// </summary>
+    public static void ValidateSqlType(string type)
     {
         if (string.IsNullOrWhiteSpace(type))
             throw new CamusException("CADB0400", "Column type must not be empty.");
-        if (ScalarTypes.Contains(type) || StringTypeRegex.IsMatch(type))
+        if (ColumnTypeRegex.IsMatch(type))
             return;
-        throw new CamusException("CADB0400",
-            $"Unknown column type '{type}'. Accepted: oid, int64, float64, float32, string(N), bool, bytes, date, datetime, uuid.");
+        throw new CamusException("CADB0400", $"Unknown column type '{type}'. {AcceptedTypesDescription}");
     }
 
     private static IEnumerable<IEnumerable<T>> Chunk<T>(IReadOnlyList<T> source, int size)
@@ -430,12 +579,24 @@ public sealed class CamusDbTools
         return "";
     }
 
-    private static Dictionary<string, object?> BranchToRow(CamusBranchRow branch) => new()
+    // The branch tools go through SQL rather than the client's ShowBranchesAsync/ShowAncestorsAsync:
+    // those call /show-branches and /show-ancestors, which current servers do not serve (404). The
+    // rows keep the camelCase forkTimestamp key the tool returned before, so its output is unchanged.
+    private static Dictionary<string, object?> BranchToRow(Dictionary<string, object?> row) => new()
     {
-        ["database"] = branch.Database,
-        ["id"] = branch.Id,
-        ["depth"] = branch.Depth,
-        ["parent"] = branch.Parent,
-        ["forkTimestamp"] = branch.ForkTimestamp,
+        ["database"] = row.GetValueOrDefault("database"),
+        ["id"] = row.GetValueOrDefault("id"),
+        ["depth"] = row.GetValueOrDefault("depth"),
+        ["parent"] = row.GetValueOrDefault("parent"),
+        ["forkTimestamp"] = row.GetValueOrDefault("fork_timestamp"),
+    };
+
+    // SHOW ANCESTORS has no parent column: each row is itself a step up the parent chain.
+    private static Dictionary<string, object?> AncestorToRow(Dictionary<string, object?> row) => new()
+    {
+        ["database"] = row.GetValueOrDefault("database"),
+        ["id"] = row.GetValueOrDefault("id"),
+        ["depth"] = row.GetValueOrDefault("depth"),
+        ["forkTimestamp"] = row.GetValueOrDefault("fork_timestamp"),
     };
 }

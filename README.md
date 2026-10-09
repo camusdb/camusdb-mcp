@@ -202,23 +202,48 @@ Or launching via the SDK without pre-building:
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | `list_databases`   | List all databases in the CamusDB cluster.                                                  |
 | `list_tables`      | List all tables in a database.                                                              |
-| `list_branches`    | List all branches of a root database. Returns an empty list if none exist.                  |
+| `list_views`       | List the views and materialized views in a database (materialized views with `populated` and `refreshed_at`). |
+| `list_sequences`   | List the sequences in a database with their options (via `SHOW SEQUENCES`).                |
+| `list_branches`    | List all branches of a root database (via `SHOW BRANCHES FROM`). Returns an empty list if none exist. |
+| `list_ancestors`   | List the ancestors of a branch database (via `SHOW ANCESTORS FROM`). Empty for a root database. |
 | `list_indexes`     | List all readable indexes on a table (via `SHOW INDEXES FROM`). Mid-backfill indexes omitted.|
 | `get_table_schema` | Get column schema for a table (via `SHOW COLUMNS FROM`): names, types, nullability, defaults.|
+| `show_create`      | Get the DDL that recreates a table, view, materialized view or sequence (via `SHOW CREATE …`). Tables can omit secondary indexes. |
+| `get_table_statistics` | Get the optimizer statistics for a table (via `SHOW STATISTICS FOR TABLE`).             |
+
+Every other `SHOW` statement (`SHOW GRANTS`, `SHOW USERS`, `SHOW VARIABLES`, `SHOW CLUSTER SETTINGS`,
+`SHOW ENGINE STATS`, `SHOW SLOW QUERIES`, `SHOW RANGES`, `SHOW ORPHAN TABLES`, `SHOW DATABASE`, the
+`LIKE` filters, …) is available through `select_query`. Result rows pass through unchanged, so a
+column the server adds to a `SHOW` result reaches the client without a change here.
 
 ### Query tools (read-only, enforced by the statement guard)
 
 | Tool            | Description                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------- |
-| `select_query`  | Execute a SELECT or SHOW statement. Mutating SQL is rejected before execution. Capped at `max_rows`. |
-| `explain_query` | Execute an EXPLAIN statement (plan / logical / physical). Bare SELECT is prefixed with EXPLAIN. |
+| `select_query`  | Execute a SELECT, SHOW or DESCRIBE statement. Mutating SQL is rejected before execution. Capped at `max_rows`. |
+| `explain_query` | Execute an EXPLAIN statement (plan / logical / physical / analyze). Bare SELECT is prefixed with EXPLAIN. |
+
+#### Parameters and result values
+
+Parameters (`@name` placeholders) are JSON values:
+
+- A string, boolean or `null` binds as that type.
+- An integer that fits in 64 bits binds as `int64`.
+- Any other number binds as `float64` when it has at most 15 significant digits. Otherwise it binds
+  as an exact `NUMERIC` with its JSON text, so no digit is lost. The server converts the value to
+  the target column type on write.
+- An array of scalars binds as an array parameter (for example `WHERE id = ANY(@ids)`, or a value for
+  an `array(T)` column). All the elements must be of one JSON kind.
+
+In results, a `NUMERIC` value is returned as its exact decimal text (`"1.5"`, `"1200"`). A .NET
+`decimal` holds only 28–29 significant digits, but a `NUMERIC` holds 38.
 
 ### Mutating tools
 
 | Tool              | Description                                                                                |
 | ----------------- | ------------------------------------------------------------------------------------------ |
 | `create_database` | Create a new database (supports IF NOT EXISTS) via the client's CREATE DATABASE entry point.|
-| `create_table`    | Create a table from a typed column definition list. Identifiers are validated.              |
+| `create_table`    | Create a table from a typed column definition list. Identifiers and types are validated.   |
 | `insert_rows`     | Insert one or more rows. Values are passed as parameters (no string interpolation), chunked at 500 rows/batch. |
 
 ## Read-only vs. mutating boundary
@@ -230,13 +255,27 @@ server. The classifier (`StatementGuard`) is self-contained — it does not embe
    (`/* … */`, including across newlines) — so a leading comment cannot hide the real first
    keyword. Block comments are removed before line comments.
 2. It then reads the **maximal leading identifier** and matches it case-insensitively against an
-   allow-list: `SELECT`/`SHOW` for `select_query`, `EXPLAIN`/`SELECT` for `explain_query`.
-   Matching the whole identifier means `SELECTED` or `SHOWROOM` never false-match.
+   allow-list: `SELECT`/`SHOW`/`DESCRIBE`/`DESC` for `select_query`, `EXPLAIN`/`SELECT` for
+   `explain_query`. Matching the whole identifier means `SELECTED` or `SHOWROOM` never false-match.
+3. It rejects a statement that calls `nextval(` or `setval(`. A `SELECT` with no `FROM` can call
+   these functions, and both move a sequence counter, so the server treats them as writes. The
+   search runs on the raw text and on the comment-stripped text, so neither a comment nor a
+   comment-like string literal can hide the call. `currval` and `lastval` only read, so they are
+   allowed.
 
 Anything else (INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, RENAME, …) is rejected with a
 `CamusException` (code `CADB0400`) **before** execution. This is the hard security boundary and is
 covered by `CamusDB.Mcp.Tests/TestStatementGuard.cs`, including comment-smuggling cases such as
 `/* SELECT */ INSERT …` and `-- x` + newline + `INSERT …`.
+
+#### Column types for `create_table`
+
+`oid`, `int64`, `float64`, `float32`, `numeric`, `string`, `string(N)`, `bool`, `bytes`, `bytes(N)`,
+`date`, `datetime`, `uuid`, `array(T)` for a scalar `T`, and `serial` (an `int64` identity column),
+plus the SQL aliases the server accepts (`int`, `smallint`, `float`, `real`, `decimal`, `varchar`,
+`char`, `text`, `boolean`, `blob`, `timestamp`, `guid`, `object_id`, `bigserial`). `numeric` has a
+fixed precision of 38 and scale of 9, and takes no `(p, s)` arguments. A column with `index: true`
+gets a table-level secondary index named `ix_<table>_<column>`.
 
 Mutating tools compose their own SQL from typed inputs. All identifiers (database, table, column
 names) are validated against `^[a-zA-Z_][a-zA-Z0-9_]*$` before interpolation. Values are never

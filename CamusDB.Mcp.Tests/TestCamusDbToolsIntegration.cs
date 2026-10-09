@@ -229,4 +229,242 @@ public sealed class TestCamusDbToolsIntegration
             await DropTableAsync(table);
         }
     }
+
+    [SkippableFact]
+    public async Task CreateTable_NonUniqueIndex_CreatesSecondaryIndex()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" },
+                    new ColumnDefinition { Name = "city", Type = "string(50)", Index = true },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            ListIndexesResult result = await CamusDbTools.ListIndexes(Camus, Db, table, CancellationToken.None);
+
+            IEnumerable<string> cells = result.Indexes.SelectMany(r => r.Values).Select(v => v?.ToString() ?? "");
+            Assert.Contains($"ix_{table}_city", cells);
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Numeric_RoundTripsExactly_IncludingValuesWiderThanDecimal()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "int64", Primary = true },
+                    new ColumnDefinition { Name = "amount", Type = "numeric" },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            // 38 significant digits: a System.Decimal cannot hold this value.
+            const string wide = "12345678901234567890123456789.123456789";
+
+            List<Dictionary<string, JsonElement>> rows =
+            [
+                new() { ["id"] = Json(1), ["amount"] = JsonDocument.Parse(wide).RootElement.Clone() },
+                new() { ["id"] = Json(2), ["amount"] = Json("1.5") },
+                new() { ["id"] = Json(3), ["amount"] = Json(42) },
+            ];
+
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(Camus, Db, table, rows, CancellationToken.None);
+            Assert.Equal(3, inserted.Inserted);
+
+            SelectQueryResult selected = await CamusDbTools.SelectQuery(
+                Camus, _fx.Config, Db, $"SELECT id, amount FROM {table} ORDER BY id", null, null, CancellationToken.None);
+
+            Assert.Equal([wide, "1.5", "42"], selected.Rows.Select(r => r["amount"]).ToArray());
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task SelectQuery_BindsArrayParameter()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "int64", Primary = true },
+                    new ColumnDefinition { Name = "tags", Type = "array(string)" },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            List<Dictionary<string, JsonElement>> rows =
+            [
+                new() { ["id"] = Json(1), ["tags"] = Json(new[] { "a", "b" }) },
+                new() { ["id"] = Json(2), ["tags"] = Json(Array.Empty<string>()) },
+                new() { ["id"] = Json(3), ["tags"] = Json(new[] { "c" }) },
+            ];
+            await CamusDbTools.InsertRows(Camus, Db, table, rows, CancellationToken.None);
+
+            SelectQueryResult selected = await CamusDbTools.SelectQuery(
+                Camus, _fx.Config, Db, $"SELECT id, tags FROM {table} WHERE id = ANY(@ids) ORDER BY id",
+                new Dictionary<string, JsonElement> { ["@ids"] = Json(new[] { 1, 3 }) }, null, CancellationToken.None);
+
+            Assert.Equal([1L, 3L], selected.Rows.Select(r => r["id"]).ToArray());
+            Assert.Equal(new object?[] { "a", "b" }, (object?[])selected.Rows[0]["tags"]!);
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task ShowCreate_ReturnsTableDdl()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" },
+                    new ColumnDefinition { Name = "email", Type = "string(200)", Index = true },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            ShowCreateResult full = await CamusDbTools.ShowCreate(Camus, Db, table, null, false, CancellationToken.None);
+            Assert.Equal(table, full.Name);
+            Assert.Contains("CREATE TABLE", full.Ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains($"ix_{table}_email", full.Ddl);
+
+            ShowCreateResult bare = await CamusDbTools.ShowCreate(Camus, Db, table, "table", true, CancellationToken.None);
+            Assert.DoesNotContain($"ix_{table}_email", bare.Ddl);
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task ListViews_AndListSequences_ReturnCreatedObjects()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        string view = table + "_v";
+        string sequence = table + "_seq";
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [new ColumnDefinition { Name = "id", Type = "int64", Primary = true }],
+                ifNotExists: false,
+                CancellationToken.None);
+            await Camus.ExecuteNonQueryAsync(Db, $"CREATE VIEW {view} AS SELECT id FROM {table}", null, CancellationToken.None);
+            await Camus.ExecuteNonQueryAsync(Db, $"CREATE SEQUENCE {sequence}", null, CancellationToken.None);
+
+            ListViewsResult views = await CamusDbTools.ListViews(Camus, Db, CancellationToken.None);
+            Assert.Contains(view, views.Views);
+
+            ListSequencesResult sequences = await CamusDbTools.ListSequences(Camus, Db, CancellationToken.None);
+            Assert.Contains(sequences.Sequences, r => r.TryGetValue("sequence", out object? v) && (v as string) == sequence);
+
+            ShowCreateResult viewDdl = await CamusDbTools.ShowCreate(Camus, Db, view, "view", false, CancellationToken.None);
+            Assert.Contains("CREATE VIEW", viewDdl.Ddl, StringComparison.OrdinalIgnoreCase);
+
+            ShowCreateResult sequenceDdl = await CamusDbTools.ShowCreate(Camus, Db, sequence, "sequence", false, CancellationToken.None);
+            Assert.Contains("CREATE SEQUENCE", sequenceDdl.Ddl, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try { await Camus.ExecuteNonQueryAsync(Db, $"DROP VIEW {view}", null, CancellationToken.None); } catch { }
+            try { await Camus.ExecuteNonQueryAsync(Db, $"DROP SEQUENCE {sequence}", null, CancellationToken.None); } catch { }
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task GetTableStatistics_AndDescribe_Succeed()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [new ColumnDefinition { Name = "id", Type = "int64", Primary = true }],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            GetTableStatisticsResult stats = await CamusDbTools.GetTableStatistics(Camus, Db, table, CancellationToken.None);
+            Assert.NotNull(stats.Statistics);
+
+            SelectQueryResult described = await CamusDbTools.SelectQuery(
+                Camus, _fx.Config, Db, $"DESCRIBE {table}", null, null, CancellationToken.None);
+            Assert.Contains(described.Rows, r => r.Values.Any(v => (v as string) == "id"));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task ListBranches_AndListAncestors_SeeBranchDatabase()
+    {
+        _fx.SkipIfUnavailable();
+
+        string branch = "mcp_br_" + Guid.NewGuid().ToString("N")[..12];
+        try
+        {
+            await Camus.ExecuteNonQueryAsync(Db, $"CREATE DATABASE {branch} BRANCH FROM {Db}", null, CancellationToken.None);
+
+            ListBranchesResult branches = await CamusDbTools.ListBranches(Camus, Db, CancellationToken.None);
+            Dictionary<string, object?> row = Assert.Single(branches.Branches, r => (r["database"] as string) == branch);
+            Assert.Equal(Db, row["parent"]);
+            Assert.Equal(1L, row["depth"]);
+            Assert.False(string.IsNullOrEmpty(row["forkTimestamp"] as string));
+
+            ListAncestorsResult ancestors = await CamusDbTools.ListAncestors(Camus, branch, CancellationToken.None);
+            Assert.Contains(ancestors.Ancestors, r => (r["database"] as string) == Db);
+        }
+        finally
+        {
+            try { await Camus.ExecuteNonQueryAsync(Db, $"DROP DATABASE {branch}", null, CancellationToken.None); } catch { }
+        }
+    }
+
+    [SkippableFact]
+    public async Task ListAncestors_OfRootDatabase_IsEmpty()
+    {
+        _fx.SkipIfUnavailable();
+
+        ListAncestorsResult result = await CamusDbTools.ListAncestors(Camus, Db, CancellationToken.None);
+
+        Assert.Empty(result.Ancestors);
+    }
 }

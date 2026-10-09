@@ -24,7 +24,7 @@ public sealed record QueryResult(IReadOnlyList<Dictionary<string, object?>> Rows
 /// <see cref="CamusConnection"/> scoped to the requested database (autocommit — no transaction
 /// handle is carried between calls) and issues the statement through the real client API:
 /// reader queries for reads, non-query execution for DML/DDL, and the dedicated client entry
-/// points for CREATE DATABASE and SHOW BRANCHES.
+/// point for CREATE DATABASE.
 ///
 /// This replaces the previous hand-rolled REST client; it never issues raw HTTP itself.
 ///
@@ -154,14 +154,6 @@ public sealed class CamusClient
             return null;
         });
 
-    /// <summary>Lists the branches of <paramref name="database"/> via the client's SHOW BRANCHES entry point.</summary>
-    public Task<IReadOnlyList<CamusBranchRow>> ShowBranchesAsync(string database, CancellationToken ct) =>
-        WithAuthDiagnostics(async () =>
-        {
-            await using CamusConnection connection = await OpenAsync(database, ct).ConfigureAwait(false);
-            return await connection.ShowBranchesAsync(database, ct).ConfigureAwait(false);
-        });
-
     // -------------------------------------------------------------------------
     // Row / parameter marshalling
     // -------------------------------------------------------------------------
@@ -170,8 +162,28 @@ public sealed class CamusClient
     {
         Dictionary<string, object?> row = new(reader.FieldCount);
         for (int i = 0; i < reader.FieldCount; i++)
-            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            row[reader.GetName(i)] = ReadCell(reader, i);
         return row;
+    }
+
+    /// <summary>
+    /// Reads one cell as a JSON-friendly CLR value. Every type takes the client's own conversion
+    /// except NUMERIC: the client reads it as a <see cref="decimal"/>, which holds 28-29 significant
+    /// digits against NUMERIC's 38 and throws on a wider value. A NUMERIC is returned as its exact
+    /// canonical text instead (<c>"1.5"</c>, <c>"1200"</c>), alone or as an array element, so a
+    /// select never fails on a wide value and no digit goes through a double on the way to JSON.
+    /// </summary>
+    private static object? ReadCell(CamusDataReader reader, int ordinal)
+    {
+        ColumnValue cell = reader.GetColumnValue(ordinal);
+        return cell.Type switch
+        {
+            ColumnType.Null => null,
+            ColumnType.Numeric => cell.StrValue,
+            ColumnType.Array when cell.ArrayElementType == ColumnType.Numeric =>
+                cell.ArrayValues?.Select(e => e.Type == ColumnType.Null ? null : e.StrValue).ToArray() ?? [],
+            _ => reader.GetValue(ordinal),
+        };
     }
 
     private static void AddParameters(CamusCommand command, IReadOnlyDictionary<string, JsonElement>? parameters)
@@ -181,6 +193,13 @@ public sealed class CamusClient
 
         foreach ((string key, JsonElement element) in parameters)
         {
+            if (element.ValueKind == JsonValueKind.Array)
+            {
+                (ColumnType elementType, object?[] values) = JsonArrayToColumn(key, element);
+                command.Parameters.Add(key, elementType, values, isArray: true);
+                continue;
+            }
+
             (ColumnType type, object? value) = JsonElementToColumn(element);
             command.Parameters.Add(key, type, value);
         }
@@ -188,18 +207,114 @@ public sealed class CamusClient
 
     /// <summary>
     /// Maps a JSON scalar to a CamusDB (<see cref="ColumnType"/>, value) pair. Strings map to
-    /// <see cref="ColumnType.String"/>, integers to <see cref="ColumnType.Integer64"/>, other
-    /// numbers to <see cref="ColumnType.Float64"/>, booleans to <see cref="ColumnType.Bool"/>, and
+    /// <see cref="ColumnType.String"/>, booleans to <see cref="ColumnType.Bool"/>, and
     /// null/anything else to <see cref="ColumnType.Null"/>.
+    ///
+    /// <para>An integer that fits a long maps to <see cref="ColumnType.Integer64"/>. Any other number
+    /// maps to <see cref="ColumnType.Float64"/> when a double keeps every digit of its JSON text, and
+    /// otherwise to <see cref="ColumnType.Numeric"/> with that exact text — so a 30-digit integer or
+    /// a NUMERIC value such as <c>12345678901234567890.123456789</c> binds without rounding. The
+    /// server coerces NUMERIC to a float column, and Integer64/Float64 to a NUMERIC column, on
+    /// write.</para>
     /// </summary>
     public static (ColumnType Type, object? Value) JsonElementToColumn(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.String => (ColumnType.String, element.GetString()),
         JsonValueKind.True => (ColumnType.Bool, (object?)true),
         JsonValueKind.False => (ColumnType.Bool, (object?)false),
-        JsonValueKind.Number => element.TryGetInt64(out long l)
-            ? (ColumnType.Integer64, (object?)l)
-            : (ColumnType.Float64, element.GetDouble()),
+        JsonValueKind.Number => NumberToColumn(element),
         _ => (ColumnType.Null, null),
     };
+
+    /// <summary>
+    /// Maps a JSON array to an array parameter: the element type and the element values. Every
+    /// non-null element must be a scalar of one JSON kind (all strings, all booleans or all numbers).
+    /// Numbers take <see cref="ColumnType.Integer64"/> when each one is an integer, else
+    /// <see cref="ColumnType.Float64"/>. An empty array is sent with no element type, and the server
+    /// adopts the target column's element type. An all-null array is sent as a string array, because
+    /// the client cannot bind non-empty elements without a type; a null element stays null in any
+    /// target column.
+    /// </summary>
+    public static (ColumnType ElementType, object?[] Values) JsonArrayToColumn(string name, JsonElement array)
+    {
+        List<JsonElement> elements = [.. array.EnumerateArray()];
+        object?[] values = new object?[elements.Count];
+
+        JsonValueKind kind = JsonValueKind.Undefined;
+        foreach (JsonElement element in elements)
+        {
+            if (element.ValueKind == JsonValueKind.Null)
+                continue;
+
+            JsonValueKind elementKind = element.ValueKind == JsonValueKind.False ? JsonValueKind.True : element.ValueKind;
+            if (elementKind is not (JsonValueKind.String or JsonValueKind.True or JsonValueKind.Number))
+                throw new CamusException("CADB0400", $"Array parameter '{name}' may only hold strings, numbers, booleans or nulls.");
+            if (kind != JsonValueKind.Undefined && kind != elementKind)
+                throw new CamusException("CADB0400", $"Array parameter '{name}' mixes element kinds; every element must have the same type.");
+            kind = elementKind;
+        }
+
+        bool allIntegers = elements.All(e => e.ValueKind != JsonValueKind.Number || e.TryGetInt64(out _));
+        ColumnType elementType = kind switch
+        {
+            JsonValueKind.String => ColumnType.String,
+            JsonValueKind.True => ColumnType.Bool,
+            JsonValueKind.Number => allIntegers ? ColumnType.Integer64 : ColumnType.Float64,
+            _ => elements.Count == 0 ? ColumnType.Null : ColumnType.String,
+        };
+
+        for (int i = 0; i < elements.Count; i++)
+        {
+            JsonElement element = elements[i];
+            values[i] = element.ValueKind switch
+            {
+                JsonValueKind.String => element.GetString(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Number when elementType == ColumnType.Integer64 => element.GetInt64(),
+                JsonValueKind.Number => element.GetDouble(),
+                _ => null,
+            };
+        }
+
+        return (elementType, values);
+    }
+
+    private static (ColumnType Type, object? Value) NumberToColumn(JsonElement element)
+    {
+        if (element.TryGetInt64(out long l))
+            return (ColumnType.Integer64, l);
+
+        string text = element.GetRawText();
+        if (element.TryGetDouble(out double d) && double.IsFinite(d) && SignificantDigits(text) <= 15)
+            return (ColumnType.Float64, d);
+
+        return (ColumnType.Numeric, text);
+    }
+
+    /// <summary>
+    /// Counts the significant digits of a JSON number's mantissa: leading zeros and the exponent are
+    /// not counted. A double keeps any decimal number of up to 15 significant digits exactly.
+    /// </summary>
+    private static int SignificantDigits(string text)
+    {
+        int exponent = text.IndexOfAny(['e', 'E']);
+        ReadOnlySpan<char> mantissa = exponent < 0 ? text : text.AsSpan(0, exponent);
+
+        int count = 0;
+        bool leading = true;
+        int trailingZeros = 0;
+        foreach (char c in mantissa)
+        {
+            if (c is < '0' or > '9')
+                continue;
+            if (leading && c == '0')
+                continue;
+            leading = false;
+            count++;
+            trailingZeros = c == '0' ? trailingZeros + 1 : 0;
+        }
+
+        return count - trailingZeros;
+    }
 }
