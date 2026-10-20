@@ -26,6 +26,20 @@ public sealed class TestMcpConfig
     }
 
     // -------------------------------------------------------------------------
+    // Defaults
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void FromEnvironment_WithNothingSet_TargetsThePlaintextHttpPort()
+    {
+        // A default CamusDB node serves plaintext HTTP on 5095; 7141 is its TLS port.
+        McpConfig config = McpConfig.FromEnvironment(Env());
+        CamusConnectionStringBuilder builder = config.BuildConnectionString(null);
+
+        Assert.Equal("http://localhost:5095", builder.Config["Endpoint"]);
+    }
+
+    // -------------------------------------------------------------------------
     // No credentials configured — behaviour must be unchanged
     // -------------------------------------------------------------------------
 

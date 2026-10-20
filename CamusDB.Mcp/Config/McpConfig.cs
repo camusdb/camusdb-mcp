@@ -46,7 +46,7 @@ public sealed class McpConfig
     /// The <c>Database</c> entry is treated as a default and is overridden per request by the
     /// database argument a tool receives (see <see cref="BuildConnectionString"/>).
     /// </summary>
-    public string BaseConnectionString { get; set; } = "Endpoint=http://localhost:7141";
+    public string BaseConnectionString { get; set; } = "Endpoint=http://localhost:5095";
 
     /// <summary>Default database applied when a tool call omits one (may be null).</summary>
     public string? DefaultDatabase { get; set; }

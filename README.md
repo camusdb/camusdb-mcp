@@ -11,7 +11,7 @@ exclusively through the client's connection/command/reader API.
 
 ## Prerequisites
 
-- A running CamusDB server reachable at a known endpoint (default `http://localhost:7141`).
+- A running CamusDB server reachable at a known endpoint (default `http://localhost:5095`).
 - .NET 10 SDK to build and run `CamusDB.Mcp`.
 
 ## Building
@@ -50,8 +50,8 @@ endpoint and let the server assemble one.
 
 | Variable                        | Default                  | Description                                                                 |
 | ------------------------------- | ------------------------ | --------------------------------------------------------------------------- |
-| `CAMUS_MCP_CONNECTION_STRING`   | (none)                   | Full CamusDB connection string, e.g. `Endpoint=http://localhost:7141;Database=mydb;Timeout=30`. Takes precedence over `CAMUS_MCP_ENDPOINT`. |
-| `CAMUS_MCP_ENDPOINT`            | `http://localhost:7141`  | CamusDB endpoint(s) when not using a full connection string. Comma-separate for round-robin. |
+| `CAMUS_MCP_CONNECTION_STRING`   | (none)                   | Full CamusDB connection string, e.g. `Endpoint=http://localhost:5095;Database=mydb;Timeout=30`. Takes precedence over `CAMUS_MCP_ENDPOINT`. |
+| `CAMUS_MCP_ENDPOINT`            | `http://localhost:5095`  | CamusDB endpoint(s) when not using a full connection string. Comma-separate for round-robin. |
 | `CAMUS_MCP_DEFAULT_DATABASE`    | (none)                   | Database used when a tool call omits one. Also picked up from the connection string's `Database`. |
 | `CAMUS_MCP_TIMEOUT_SECONDS`     | `10` (client default)    | Per-command timeout, applied when assembling a connection string from `CAMUS_MCP_ENDPOINT`. |
 | `CAMUS_MCP_MAX_ROWS`            | `1000`                   | Hard cap on rows returned by `select_query`.                                |
@@ -77,7 +77,7 @@ Against a server started with `CAMUSDB_AUTH_ENABLED=true`, give the MCP server a
     "camusdb": {
       "command": "/path/to/CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp",
       "env": {
-        "CAMUS_MCP_ENDPOINT": "https://camus.internal:5095",
+        "CAMUS_MCP_ENDPOINT": "https://camus.internal:7141",
         "CAMUS_MCP_DEFAULT_DATABASE": "mydb",
         "CAMUS_MCP_USER": "mcp",
         "CAMUS_MCP_PASSWORD": "…"
@@ -140,6 +140,10 @@ non-loopback deployment use an `https://` endpoint, or the server answers `CADB0
 terminates in front of the node (ingress, sidecar, mesh), start the server with
 `--require-tls-when-auth-enabled false` and keep the plaintext hop inside the trust boundary.
 
+A default CamusDB node serves plaintext HTTP on port `5095` and HTTPS on port `7141` (the HTTPS
+listener only starts when the server has a certificate configured). Pair the scheme with the
+matching port: `http://host:5095` or `https://host:7141`.
+
 ## Launching from an MCP client
 
 You do not run the server by hand — the MCP client launches it over stdio.
@@ -152,7 +156,7 @@ You do not run the server by hand — the MCP client launches it over stdio.
     "camusdb": {
       "command": "/path/to/CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp",
       "env": {
-        "CAMUS_MCP_ENDPOINT": "http://localhost:7141",
+        "CAMUS_MCP_ENDPOINT": "http://localhost:5095",
         "CAMUS_MCP_DEFAULT_DATABASE": "mydb"
       }
     }
@@ -170,7 +174,7 @@ Using the built binary:
     "camusdb": {
       "command": "/path/to/CamusDB.Mcp/bin/Debug/net10.0/CamusDB.Mcp",
       "env": {
-        "CAMUS_MCP_CONNECTION_STRING": "Endpoint=http://localhost:7141;Database=mydb;Timeout=30"
+        "CAMUS_MCP_CONNECTION_STRING": "Endpoint=http://localhost:5095;Database=mydb;Timeout=30"
       }
     }
   }
@@ -186,7 +190,7 @@ Or launching via the SDK without pre-building:
       "command": "dotnet",
       "args": ["run", "--project", "/path/to/camusdb-mcp/CamusDB.Mcp"],
       "env": {
-        "CAMUS_MCP_ENDPOINT": "http://localhost:7141",
+        "CAMUS_MCP_ENDPOINT": "http://localhost:5095",
         "CAMUS_MCP_DEFAULT_DATABASE": "mydb"
       }
     }
