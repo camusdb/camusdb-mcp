@@ -145,6 +145,30 @@ public sealed class CamusClient
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     });
 
+    /// <summary>
+    /// Executes a mutating statement that ends in a <c>RETURNING</c> list and materializes every row
+    /// it returns. The command is a write command (not a select command), so the client sends it with
+    /// the connection's autocommit write options; the server sends no row before the commit.
+    /// </summary>
+    public Task<QueryResult> ExecuteReturningAsync(
+        string? database,
+        string sql,
+        IReadOnlyDictionary<string, JsonElement>? parameters,
+        CancellationToken ct) => WithAuthDiagnostics(async () =>
+    {
+        await using CamusConnection connection = await OpenAsync(database, ct).ConfigureAwait(false);
+        using CamusCommand command = connection.CreateCamusCommand(sql);
+        AddParameters(command, parameters);
+
+        await using CamusDataReader reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+        List<Dictionary<string, object?>> rows = [];
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            rows.Add(ReadRow(reader));
+
+        return new QueryResult(rows, Truncated: false);
+    });
+
     /// <summary>Creates a database via the client's dedicated CREATE DATABASE entry point.</summary>
     public Task CreateDatabaseAsync(string name, bool ifNotExists, CancellationToken ct) =>
         WithAuthDiagnostics<object?>(async () =>

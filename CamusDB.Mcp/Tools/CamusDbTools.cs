@@ -66,8 +66,39 @@ public sealed record CreateDatabaseResult(bool Ok);
 /// <summary>Result of <c>create_table</c>.</summary>
 public sealed record CreateTableResult(bool Ok);
 
-/// <summary>Result of <c>insert_rows</c>: the total number of inserted rows.</summary>
-public sealed record InsertRowsResult(int Inserted);
+/// <summary>
+/// Result of <c>insert_rows</c>: the number of rows written (inserted plus updated, under an upsert)
+/// and, when a RETURNING list was requested, the returned rows; null otherwise.
+/// </summary>
+public sealed record InsertRowsResult(int Inserted, Dictionary<string, object?>[]? Returned = null);
+
+/// <summary>Result of <c>get_statement_stats</c>: one row per statement shape, and whether more existed.</summary>
+public sealed record GetStatementStatsResult(Dictionary<string, object?>[] Statements, bool Truncated);
+
+/// <summary>Result of <c>get_slow_queries</c>: the slow query log entries, newest first.</summary>
+public sealed record GetSlowQueriesResult(Dictionary<string, object?>[] Queries, bool Truncated);
+
+/// <summary>Result of <c>get_index_usage</c>: one row per index with its read and write counters.</summary>
+public sealed record GetIndexUsageResult(Dictionary<string, object?>[] Indexes, bool Truncated);
+
+/// <summary>Result of <c>list_running_queries</c>: one row per statement that runs now.</summary>
+public sealed record ListRunningQueriesResult(Dictionary<string, object?>[] Queries, bool Truncated);
+
+/// <summary>Result of <c>list_connections</c>: one row per open client or peer connection.</summary>
+public sealed record ListConnectionsResult(Dictionary<string, object?>[] Connections, bool Truncated);
+
+/// <summary>Result of <c>get_engine_stats</c>: one row per engine metric.</summary>
+public sealed record GetEngineStatsResult(Dictionary<string, object?>[] Stats, bool Truncated);
+
+/// <summary>
+/// Result of <c>get_settings</c>: the effective configuration of the node that answers, and the
+/// cluster settings that a <c>SET CLUSTER SETTING</c> changed.
+/// </summary>
+public sealed record GetSettingsResult(
+    Dictionary<string, object?>[] Variables, Dictionary<string, object?>[] ClusterOverrides, bool Truncated);
+
+/// <summary>Result of <c>list_extensions</c>: one row per extension build the node loaded.</summary>
+public sealed record ListExtensionsResult(Dictionary<string, object?>[] Extensions, bool Truncated);
 
 // -------------------------------------------------------------------------
 // Column definition input model for create_table
@@ -313,7 +344,7 @@ public sealed class CamusDbTools
 
     /// <summary>Executes a read-only SELECT or SHOW statement.</summary>
     [McpServerTool]
-    [Description("Execute a SELECT, SHOW or DESCRIBE statement. Mutating statements (INSERT, UPDATE, DELETE, DROP, CREATE) are rejected before execution. Results are capped at max_rows (default 1000). NUMERIC values are returned as their exact decimal text. Parameters may be JSON scalars or arrays of scalars (bound as array parameters).")]
+    [Description("Execute a SELECT, SHOW or DESCRIBE statement, including UNION / INTERSECT / EXCEPT [ALL] set operations. Mutating statements (INSERT, UPDATE, DELETE, DROP, CREATE) and row-locking reads (SELECT ... FOR UPDATE) are rejected before execution. Results are capped at max_rows (default 1000). NUMERIC values are returned as their exact decimal text. Parameters may be JSON scalars or arrays of scalars (bound as array parameters).")]
     public static async Task<SelectQueryResult> SelectQuery(
         CamusClient camus,
         McpConfig config,
@@ -333,7 +364,7 @@ public sealed class CamusDbTools
 
     /// <summary>Executes an EXPLAIN statement to get the query plan.</summary>
     [McpServerTool]
-    [Description("Execute an EXPLAIN statement. Mode can be 'plan' (default), 'logical', 'physical', or 'analyze'. If the sql argument already starts with EXPLAIN, it is forwarded as-is; otherwise EXPLAIN is prepended. 'analyze' runs the SELECT and reports measured per-operator statistics; it is unsupported on joins and on a FROM-less SELECT, and surfaces as a tool error there.")]
+    [Description("Execute an EXPLAIN statement. Mode can be 'plan' (default), 'logical', 'physical', or 'analyze'. If the sql argument already starts with EXPLAIN, it is forwarded as-is; otherwise EXPLAIN is prepended. 'analyze' runs the SELECT and reports measured per-operator statistics; it is unsupported on a FROM-less SELECT, and surfaces as a tool error there. A row-locking read (FOR UPDATE) is accepted in the plan modes, which take no lock, and rejected under 'analyze', which takes the locks.")]
     public static async Task<ExplainQueryResult> ExplainQuery(
         CamusClient camus,
         [Description("Database name.")] string database,
@@ -341,7 +372,7 @@ public sealed class CamusDbTools
         [Description("Plan mode: 'plan' (default), 'logical', 'physical', or 'analyze'.")] string? mode = null,
         CancellationToken ct = default)
     {
-        string keyword = StatementGuard.AssertExplain(sql);
+        string keyword = StatementGuard.AssertExplain(sql, mode);
 
         string explainSql;
         if (keyword == "EXPLAIN")
@@ -455,26 +486,44 @@ public sealed class CamusDbTools
 
     /// <summary>Inserts rows into a table using parameterized INSERT statements.</summary>
     [McpServerTool]
-    [Description("Insert one or more rows into a table. Rows are a list of column→value objects. Values are passed as SQL parameters (no string interpolation). Large batches are chunked to respect the per-transaction mutation limit. Returns the total number of inserted rows.")]
+    [Description("Insert one or more rows into a table. Rows are a list of column→value objects. Values are passed as SQL parameters (no string interpolation). Large batches are chunked to respect the per-transaction mutation limit; each chunk commits on its own. onConflict sets what happens to a row whose unique key is already taken: 'error' (default) fails the chunk, 'do_nothing' skips the row (INSERT ... ON CONFLICT DO NOTHING), and 'upsert' updates the stored row with the row's values (UPSERT INTO, or ON CONFLICT (conflictColumns) DO UPDATE). With 'upsert', a key must appear only once in a chunk of 500 rows. returning lists columns to read back from each written row, such as generated ids. Returns the number of rows written: inserted plus updated rows; skipped rows are not counted.")]
     public static async Task<InsertRowsResult> InsertRows(
         CamusClient camus,
         [Description("Database name.")] string database,
         [Description("Table name.")] string table,
         [Description("Rows to insert. Each row is an object mapping column names to values (string, number, bool, or null).")] IReadOnlyList<Dictionary<string, JsonElement>> rows,
+        [Description("What to do with a row whose unique key is already taken: 'error' (default), 'do_nothing' or 'upsert'. 'upsert' needs the UPDATE privilege as well as INSERT.")] string? onConflict = null,
+        [Description("The columns of the unique index that decides a conflict (the arbiter), for example ['email']. Omitted: 'do_nothing' uses every unique index and 'upsert' uses the primary key. With 'upsert', every inserted column that is not listed here is updated.")] IReadOnlyList<string>? conflictColumns = null,
+        [Description("Columns to return from each written row, or ['*'] for every column. The values are the stored values, so they include defaults such as gen_id(), sequence and serial values. Under 'upsert' an updated row returns its new values. Needs the SELECT privilege.")] IReadOnlyList<string>? returning = null,
         CancellationToken ct = default)
     {
         IdentifierValidator.Validate(database, "database");
         IdentifierValidator.Validate(table, "table");
 
+        string action = ParseConflictAction(onConflict);
+        string[] arbiter = [.. conflictColumns ?? []];
+        foreach (string col in arbiter)
+            IdentifierValidator.Validate(col, "conflict column");
+        if (action == "error" && arbiter.Length > 0)
+            throw new CamusException("CADB0400", "conflictColumns needs onConflict 'do_nothing' or 'upsert'.");
+
+        string returningClause = BuildReturningClause(returning);
+
         if (rows == null || rows.Count == 0)
-            return new InsertRowsResult(0);
+            return new InsertRowsResult(0, returningClause.Length > 0 ? [] : null);
 
         // Use first row to get column names; validate all column names.
         string[] columns = [.. rows[0].Keys];
         foreach (string col in columns)
             IdentifierValidator.Validate(col, "column name");
 
+        // UPSERT INTO is the server's short form of ON CONFLICT (<primary key>) DO UPDATE, so it is
+        // used when no arbiter is named; a named arbiter needs the explicit clause.
+        string verb = action == "upsert" && arbiter.Length == 0 ? "UPSERT INTO " : "INSERT INTO ";
+        string suffix = BuildConflictClause(action, columns, arbiter) + returningClause;
+
         int totalInserted = 0;
+        List<Dictionary<string, object?>>? returned = returningClause.Length > 0 ? [] : null;
 
         // Chunk to stay within MaxMutationsPerTransaction. 500 rows per batch is safe for
         // tables with up to 40 secondary indexes (500 * 40 = 20,000 = MaxMutationsPerTransaction).
@@ -482,22 +531,241 @@ public sealed class CamusDbTools
         foreach (IEnumerable<Dictionary<string, JsonElement>> chunk in Chunk(rows, ChunkSize))
         {
             List<Dictionary<string, JsonElement>> rowList = chunk.ToList();
-            string sql = BuildInsertSql(table, columns, rowList);
+            string sql = BuildInsertSql(verb, table, columns, rowList) + suffix;
             Dictionary<string, JsonElement> parameters = BuildInsertParameters(columns, rowList);
-            totalInserted += await camus.ExecuteNonQueryAsync(database, sql, parameters, ct).ConfigureAwait(false);
+
+            if (returned is null)
+            {
+                totalInserted += await camus.ExecuteNonQueryAsync(database, sql, parameters, ct).ConfigureAwait(false);
+                continue;
+            }
+
+            // The row count of a RETURNING statement always equals the number of returned rows.
+            QueryResult result = await camus.ExecuteReturningAsync(database, sql, parameters, ct).ConfigureAwait(false);
+            returned.AddRange(result.Rows);
+            totalInserted += result.Rows.Count;
         }
 
-        return new InsertRowsResult(totalInserted);
+        return new InsertRowsResult(totalInserted, returned?.ToArray());
+    }
+
+    // -------------------------------------------------------------------------
+    // Diagnostic tools
+    // -------------------------------------------------------------------------
+
+    /// <summary>Returns the per-shape statement statistics of the node.</summary>
+    [McpServerTool]
+    [Description("Get the statement statistics of the node that answers (SHOW STATEMENT STATS): one row per statement shape with calls, total_ms, min_ms and mean_ms, rows read and returned, full scans, spills, errors, retries and plan changes. Use it to find the statements that cost the most in total, not only the slow ones. Off by default: an operator turns it on with statement_stats_enabled. Requires a superuser when authentication is enabled. The totals are in memory and one node's view only.")]
+    public static async Task<GetStatementStatsResult> GetStatementStats(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional LIKE pattern on the statement text, for example '%FROM orders%'.")] string? like = null,
+        CancellationToken ct = default)
+    {
+        QueryResult result = await QueryDiagnosticAsync(camus, config, null, "SHOW STATEMENT STATS" + LikeClause(like), ct).ConfigureAwait(false);
+        return new GetStatementStatsResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Returns the slow query log of the node.</summary>
+    [McpServerTool]
+    [Description("Get the slow query log of the node that answers (SHOW SLOW QUERIES): statements that ran at or above slow_query_log_threshold_ms, newest first, with their duration, database and text. Off by default: an operator turns it on with slow_query_log_enabled. Requires a superuser when authentication is enabled. The log is in memory and one node's view only.")]
+    public static async Task<GetSlowQueriesResult> GetSlowQueries(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional LIKE pattern on the statement text, for example '%FROM orders%'.")] string? like = null,
+        CancellationToken ct = default)
+    {
+        QueryResult result = await QueryDiagnosticAsync(camus, config, null, "SHOW SLOW QUERIES" + LikeClause(like), ct).ConfigureAwait(false);
+        return new GetSlowQueriesResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Returns the read and write counters of the indexes in a database.</summary>
+    [McpServerTool]
+    [Description("Get index usage counters (SHOW INDEX USAGE): for each index, how often statements read it (reads), how often a constraint check read it (constraint_reads), and how often writes maintained it (writes), since tracked_since. An index with reads = 0 and constraint_reads = 0 but writes > 0 over a long window is a candidate to drop; a unique index or primary key enforces a constraint and is not removable for that reason. Requires a superuser when authentication is enabled. The counters are in memory and one node's view only, so an index is unused only if it is unused on every node.")]
+    public static async Task<GetIndexUsageResult> GetIndexUsage(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Database name.")] string database,
+        [Description("Optional table name. Omitted: every index of every table in the database.")] string? table = null,
+        CancellationToken ct = default)
+    {
+        IdentifierValidator.Validate(database, "database");
+        string sql = "SHOW INDEX USAGE";
+        if (!string.IsNullOrEmpty(table))
+        {
+            IdentifierValidator.Validate(table, "table");
+            sql += $" FROM {table}";
+        }
+
+        QueryResult result = await QueryDiagnosticAsync(camus, config, database, sql, ct).ConfigureAwait(false);
+        return new GetIndexUsageResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Lists the statements that run now.</summary>
+    [McpServerTool]
+    [Description("List the statements that run now (SHOW QUERIES, or SHOW CLUSTER QUERIES with cluster = true), with their query_id, user, database, transaction, phase, elapsed_ms and text. A superuser sees every statement; another user sees only their own. In the cluster form, a node that does not answer gives one row with its error column set.")]
+    public static async Task<ListRunningQueriesResult> ListRunningQueries(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional LIKE pattern on the statement text, for example '%FROM orders%'.")] string? like = null,
+        [Description("If true, collects the statements from every node of the cluster.")] bool cluster = false,
+        CancellationToken ct = default)
+    {
+        string sql = (cluster ? "SHOW CLUSTER QUERIES" : "SHOW QUERIES") + LikeClause(like);
+        QueryResult result = await QueryDiagnosticAsync(camus, config, null, sql, ct).ConfigureAwait(false);
+        return new ListRunningQueriesResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Lists the open connections.</summary>
+    [McpServerTool]
+    [Description("List the open client and peer connections (SHOW CONNECTIONS, or SHOW CLUSTER CONNECTIONS with cluster = true), with protocol, user, age_ms, idle_ms, requests and active_queries. A superuser sees every connection; another user sees only their own.")]
+    public static async Task<ListConnectionsResult> ListConnections(
+        CamusClient camus,
+        McpConfig config,
+        [Description("If true, collects the connections from every node of the cluster.")] bool cluster = false,
+        CancellationToken ct = default)
+    {
+        string sql = cluster ? "SHOW CLUSTER CONNECTIONS" : "SHOW CONNECTIONS";
+        QueryResult result = await QueryDiagnosticAsync(camus, config, null, sql, ct).ConfigureAwait(false);
+        return new ListConnectionsResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Returns the engine metrics of the node.</summary>
+    [McpServerTool]
+    [Description("Get the engine metrics of the node that answers (SHOW ENGINE STATS): counters and latency distributions of the storage, Raft and execution layers. Two readings a short time apart show a rate. Requires a superuser when authentication is enabled.")]
+    public static async Task<GetEngineStatsResult> GetEngineStats(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional LIKE pattern on the metric name, for example 'raft.executor%'.")] string? like = null,
+        CancellationToken ct = default)
+    {
+        QueryResult result = await QueryDiagnosticAsync(camus, config, null, "SHOW ENGINE STATS" + LikeClause(like), ct).ConfigureAwait(false);
+        return new GetEngineStatsResult([.. result.Rows], result.Truncated);
+    }
+
+    /// <summary>Returns the effective configuration of the node and the cluster setting overrides.</summary>
+    [McpServerTool]
+    [Description("Get the server settings. 'variables' (SHOW VARIABLES) is the configuration the node that answers runs: one row per setting with its value, type, default, source (default, config, env, cli or cluster), mutability (runtime or restart) and scope (cluster or node); secrets are masked. 'clusterOverrides' (SHOW CLUSTER SETTINGS) lists only the settings that a SET CLUSTER SETTING changed for the whole cluster, so it is empty until someone changes one. This tool only reads settings. Requires a superuser when authentication is enabled.")]
+    public static async Task<GetSettingsResult> GetSettings(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional LIKE pattern on the setting name, for example 'slow_query%'.")] string? like = null,
+        CancellationToken ct = default)
+    {
+        string likeClause = LikeClause(like);
+        QueryResult variables = await QueryDiagnosticAsync(camus, config, null, "SHOW VARIABLES" + likeClause, ct).ConfigureAwait(false);
+        QueryResult overrides = await QueryDiagnosticAsync(camus, config, null, "SHOW CLUSTER SETTINGS" + likeClause, ct).ConfigureAwait(false);
+        return new GetSettingsResult([.. variables.Rows], [.. overrides.Rows], variables.Truncated || overrides.Truncated);
+    }
+
+    /// <summary>Lists the extension builds the node loaded.</summary>
+    [McpServerTool]
+    [Description("List the C# extension builds the node loaded (SHOW EXTENSIONS): name, version, trust, sha256 and the functions, triggers, procedures, aggregates and table functions each one registered, with their SQL signatures. With a database, status is 'installed' for the build that database uses, 'available' for the others, and 'missing' for an extension the database installed that this node does not load. Node-local; requires a superuser when authentication is enabled.")]
+    public static async Task<ListExtensionsResult> ListExtensions(
+        CamusClient camus,
+        McpConfig config,
+        [Description("Optional database name, to see which extensions that database installed.")] string? database = null,
+        CancellationToken ct = default)
+    {
+        if (!string.IsNullOrEmpty(database))
+            IdentifierValidator.Validate(database, "database");
+
+        QueryResult result = await QueryDiagnosticAsync(camus, config, NullIfEmpty(database), "SHOW EXTENSIONS", ct).ConfigureAwait(false);
+        return new ListExtensionsResult([.. result.Rows], result.Truncated);
     }
 
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
 
-    private static string BuildInsertSql(string table, string[] columns, List<Dictionary<string, JsonElement>> rows)
+    private static Task<QueryResult> QueryDiagnosticAsync(
+        CamusClient camus, McpConfig config, string? database, string sql, CancellationToken ct) =>
+        camus.QueryAsync(database, sql, null, config.MaxRows, ct);
+
+    private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
+
+    private static string LikeClause(string? like) =>
+        string.IsNullOrEmpty(like) ? "" : " LIKE " + QuoteLiteral(like, "like pattern");
+
+    /// <summary>
+    /// Quotes <paramref name="value"/> as a plain single-quoted SQL string literal, with each quote
+    /// doubled. The SHOW ... LIKE grammar takes a literal, not a placeholder, so this is the only way
+    /// the value reaches the statement. The CamusDB lexer does not accept a control character in a
+    /// plain literal, and a backslash in one is an ordinary character, so a value with a control
+    /// character is refused and nothing else can end the literal early.
+    /// </summary>
+    public static string QuoteLiteral(string value, string what)
+    {
+        foreach (char c in value)
+        {
+            if (c is '\a' or '\b' or '\f' or '\n' or '\r' or '\t' or '\v' or '\0')
+                throw new CamusException("CADB0400", $"The {what} must not contain control characters.");
+        }
+
+        return "'" + value.Replace("'", "''") + "'";
+    }
+
+    /// <summary>
+    /// Normalizes the <c>onConflict</c> input of <c>insert_rows</c> to <c>error</c>,
+    /// <c>do_nothing</c> or <c>upsert</c>. Throws <see cref="CamusException"/> with code
+    /// <c>CADB0400</c> for anything else.
+    /// </summary>
+    public static string ParseConflictAction(string? onConflict) =>
+        (onConflict?.Trim().ToLowerInvariant() ?? "") switch
+        {
+            "" or "error" => "error",
+            "do_nothing" or "do nothing" or "nothing" => "do_nothing",
+            "upsert" or "update" or "do_update" or "do update" => "upsert",
+            _ => throw new CamusException("CADB0400",
+                $"Unknown onConflict value '{onConflict}'. Accepted: error, do_nothing, upsert."),
+        };
+
+    /// <summary>
+    /// Composes the ON CONFLICT clause of <c>insert_rows</c> (with a leading space), or an empty
+    /// string when none is needed: for <c>error</c>, and for an <c>upsert</c> with no arbiter, which
+    /// is sent as UPSERT INTO. An upsert whose columns are all in the arbiter has nothing to update,
+    /// so it leaves a taken key's row as it is, as UPSERT INTO does.
+    /// </summary>
+    public static string BuildConflictClause(string action, IReadOnlyList<string> columns, IReadOnlyList<string> arbiter)
+    {
+        if (action == "error" || (action == "upsert" && arbiter.Count == 0))
+            return "";
+
+        string target = arbiter.Count > 0 ? $" ({string.Join(", ", arbiter)})" : "";
+        string[] updated = action == "upsert"
+            ? [.. columns.Where(c => !arbiter.Contains(c, StringComparer.OrdinalIgnoreCase))]
+            : [];
+
+        if (updated.Length == 0)
+            return $" ON CONFLICT{target} DO NOTHING";
+
+        return $" ON CONFLICT{target} DO UPDATE SET " +
+               string.Join(", ", updated.Select(c => $"{c} = excluded.{c}"));
+    }
+
+    /// <summary>
+    /// Composes the RETURNING clause of <c>insert_rows</c> (with a leading space), or an empty string
+    /// when no column is requested. Each item must be <c>*</c> or a valid identifier, so no expression
+    /// is ever interpolated.
+    /// </summary>
+    public static string BuildReturningClause(IReadOnlyList<string>? returning)
+    {
+        if (returning is null || returning.Count == 0)
+            return "";
+
+        foreach (string item in returning)
+        {
+            if (item != "*")
+                IdentifierValidator.Validate(item, "returning column");
+        }
+
+        return " RETURNING " + string.Join(", ", returning);
+    }
+
+    private static string BuildInsertSql(string verb, string table, string[] columns, List<Dictionary<string, JsonElement>> rows)
     {
         StringBuilder sb = new();
-        sb.Append("INSERT INTO ");
+        sb.Append(verb);
         sb.Append(table);
         sb.Append(" (");
         sb.Append(string.Join(", ", columns));
@@ -579,9 +847,10 @@ public sealed class CamusDbTools
         return "";
     }
 
-    // The branch tools go through SQL rather than the client's ShowBranchesAsync/ShowAncestorsAsync:
-    // those call /show-branches and /show-ancestors, which current servers do not serve (404). The
-    // rows keep the camelCase forkTimestamp key the tool returned before, so its output is unchanged.
+    // The branch tools send SHOW BRANCHES / SHOW ANCESTORS as SQL, which is also what the client's
+    // ShowBranchesAsync/ShowAncestorsAsync send since 0.16.7 (earlier clients called REST routes the
+    // server never had). The rows keep the camelCase forkTimestamp key the tool returned before, so
+    // its output is unchanged.
     private static Dictionary<string, object?> BranchToRow(Dictionary<string, object?> row) => new()
     {
         ["database"] = row.GetValueOrDefault("database"),

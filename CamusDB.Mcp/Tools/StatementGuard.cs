@@ -27,6 +27,10 @@ namespace CamusDB.Mcp.Tools;
 /// <c>FROM</c> may call <c>nextval</c> or <c>setval</c>, and both move a sequence counter (the
 /// server authorizes them as writes). The read-only checks therefore also refuse any call to
 /// either function.
+///
+/// A <c>SELECT … FOR UPDATE</c> is also refused where it would run: it takes exclusive row locks
+/// in its own read-write transaction and needs the UPDATE privilege. Plain <c>EXPLAIN</c> of a
+/// locking read takes no lock, so only <c>EXPLAIN (ANALYZE)</c> refuses it.
 /// </summary>
 public static partial class StatementGuard
 {
@@ -43,6 +47,37 @@ public static partial class StatementGuard
     [GeneratedRegex(@"(?<![a-zA-Z0-9_])[`""]?(nextval|setval)[`""]?\s*\(", RegexOptions.IgnoreCase)]
     private static partial Regex SequenceWriteCallRegex();
 
+    // FOR SHARE and FOR KEY SHARE are refused by the server today; they are listed so a future
+    // server that accepts them cannot take a lock through a read tool.
+    [GeneratedRegex(@"(?<![a-zA-Z0-9_])FOR\s+(NO\s+KEY\s+UPDATE|UPDATE|KEY\s+SHARE|SHARE)(?![a-zA-Z0-9_])", RegexOptions.IgnoreCase)]
+    private static partial Regex LockingClauseRegex();
+
+    [GeneratedRegex(@"(?<![a-zA-Z0-9_])EXPLAIN\s*\(\s*ANALYZE\s*\)", RegexOptions.IgnoreCase)]
+    private static partial Regex ExplainAnalyzeRegex();
+
+    /// <summary>
+    /// Returns true when the statement has a row-locking clause (<c>FOR UPDATE</c>,
+    /// <c>FOR NO KEY UPDATE</c>, <c>FOR SHARE</c>, <c>FOR KEY SHARE</c>). Like
+    /// <see cref="SequenceWriteCall"/>, the search runs over the raw and the comment-stripped text, and
+    /// a string literal that contains the words is a false positive, which is the safe direction.
+    /// </summary>
+    public static bool HasLockingClause(string sql)
+    {
+        if (string.IsNullOrEmpty(sql))
+            return false;
+
+        return LockingClauseRegex().IsMatch(sql) || LockingClauseRegex().IsMatch(StripComments(sql));
+    }
+
+    private static void AssertNoLockingClause(string sql, string tool, string reason)
+    {
+        if (HasLockingClause(sql))
+            throw new CamusException("CADB0400", $"{tool} does not accept row-locking reads (FOR UPDATE): {reason}");
+    }
+
+    private static string StripComments(string sql) =>
+        LineCommentRegex().Replace(BlockCommentRegex().Replace(sql, " "), " ");
+
     /// <summary>
     /// Returns the name of a sequence-mutating function (<c>nextval</c> or <c>setval</c>) the
     /// statement calls, or null when it calls neither. The search runs over the raw text and over
@@ -58,10 +93,7 @@ public static partial class StatementGuard
 
         Match match = SequenceWriteCallRegex().Match(sql);
         if (!match.Success)
-        {
-            string stripped = LineCommentRegex().Replace(BlockCommentRegex().Replace(sql, " "), " ");
-            match = SequenceWriteCallRegex().Match(stripped);
-        }
+            match = SequenceWriteCallRegex().Match(StripComments(sql));
 
         return match.Success ? match.Groups[1].Value.ToLowerInvariant() : null;
     }
@@ -78,16 +110,17 @@ public static partial class StatementGuard
     /// Removes block and line comments, then returns the uppercased leading keyword of the
     /// statement (empty string when the statement has no leading identifier). Block comments are
     /// stripped before line comments so a <c>/* … */</c> spanning newlines cannot leave a dangling
-    /// fragment that hides the keyword.
+    /// fragment that hides the keyword. Leading parentheses are skipped, so a set operation whose
+    /// first operand is parenthesized (<c>(SELECT …) UNION SELECT …</c>) classifies as SELECT.
     /// </summary>
     public static string FirstKeyword(string sql)
     {
         if (sql is null)
             return "";
 
-        string stripped = BlockCommentRegex().Replace(sql, " ");
-        stripped = LineCommentRegex().Replace(stripped, " ");
-        stripped = stripped.TrimStart();
+        string stripped = StripComments(sql).TrimStart();
+        while (stripped.StartsWith('('))
+            stripped = stripped[1..].TrimStart();
 
         Match match = LeadingKeywordRegex().Match(stripped);
         return match.Success ? match.Value.ToUpperInvariant() : "";
@@ -105,6 +138,8 @@ public static partial class StatementGuard
         if (keyword is "SELECT" or "SHOW" or "DESCRIBE" or "DESC")
         {
             AssertNoSequenceWrite(sql, "select_query");
+            AssertNoLockingClause(sql, "select_query",
+                "it takes exclusive row locks in a read-write transaction, and the locks end with the statement.");
             return;
         }
 
@@ -118,14 +153,23 @@ public static partial class StatementGuard
     /// Asserts the statement is explainable: its first keyword must be <c>EXPLAIN</c> or a bare
     /// <c>SELECT</c> (which the tool prefixes with EXPLAIN). Throws <see cref="CamusException"/>
     /// with code <c>CADB0400</c> for mutating statements. Returns the uppercased first keyword so
-    /// the caller can tell an already-EXPLAIN statement from a bare SELECT.
+    /// the caller can tell an already-EXPLAIN statement from a bare SELECT. A row-locking read is
+    /// refused only when it runs: a bare SELECT with <paramref name="mode"/> <c>analyze</c>, or an
+    /// <c>EXPLAIN (ANALYZE)</c> statement.
     /// </summary>
-    public static string AssertExplain(string sql)
+    public static string AssertExplain(string sql, string? mode = null)
     {
         string keyword = FirstKeyword(sql);
         if (keyword is "EXPLAIN" or "SELECT")
         {
             AssertNoSequenceWrite(sql, "explain_query");
+
+            bool analyze = keyword == "SELECT"
+                ? string.Equals(mode, "analyze", StringComparison.OrdinalIgnoreCase)
+                : ExplainAnalyzeRegex().IsMatch(StripComments(sql));
+            if (analyze)
+                AssertNoLockingClause(sql, "explain_query in analyze mode",
+                    "EXPLAIN (ANALYZE) runs the statement and takes the row locks. Use plan mode to see the plan.");
             return keyword;
         }
 

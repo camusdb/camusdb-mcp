@@ -8,6 +8,7 @@
 
 using System.Text.Json;
 using CamusDB.Mcp.Client;
+using CamusDB.Mcp.Config;
 using CamusDB.Mcp.Tools;
 using Xunit;
 
@@ -151,7 +152,7 @@ public sealed class TestCamusDbToolsIntegration
                 new() { ["name"] = Json("Bob"), ["age"] = Json(41) },
             ];
 
-            InsertRowsResult inserted = await CamusDbTools.InsertRows(Camus, Db, table, rows, CancellationToken.None);
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(Camus, Db, table, rows, ct: CancellationToken.None);
             Assert.Equal(2, inserted.Inserted);
 
             SelectQueryResult selected = await CamusDbTools.SelectQuery(
@@ -231,6 +232,277 @@ public sealed class TestCamusDbToolsIntegration
     }
 
     [SkippableFact]
+    public async Task SelectQuery_RunsParenthesizedSetOperation()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" },
+                    new ColumnDefinition { Name = "n", Type = "int64" },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [
+                    new() { ["n"] = Json(1) },
+                    new() { ["n"] = Json(2) },
+                    new() { ["n"] = Json(3) },
+                ],
+                ct: CancellationToken.None);
+
+            SelectQueryResult result = await CamusDbTools.SelectQuery(
+                Camus, _fx.Config, Db,
+                $"(SELECT n FROM {table} WHERE n <= 2) UNION ALL SELECT n FROM {table} WHERE n >= 2 ORDER BY 1",
+                null, null, CancellationToken.None);
+
+            Assert.Equal([1L, 2L, 2L, 3L], result.Rows.Select(r => Convert.ToInt64(r["n"])));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    private async Task<string> CreateKeyValueTableAsync()
+    {
+        string table = UniqueTableName();
+        await CamusDbTools.CreateTable(
+            Camus, Db, table,
+            [
+                new ColumnDefinition { Name = "k", Type = "string(20)", Primary = true },
+                new ColumnDefinition { Name = "n", Type = "int64" },
+            ],
+            ifNotExists: false,
+            CancellationToken.None);
+
+        await CamusDbTools.InsertRows(
+            Camus, Db, table,
+            [
+                new() { ["k"] = Json("a"), ["n"] = Json(1) },
+                new() { ["k"] = Json("b"), ["n"] = Json(2) },
+            ],
+            ct: CancellationToken.None);
+
+        return table;
+    }
+
+    private async Task<Dictionary<string, long>> ReadKeyValuesAsync(string table)
+    {
+        SelectQueryResult result = await CamusDbTools.SelectQuery(
+            Camus, _fx.Config, Db, $"SELECT k, n FROM {table} ORDER BY k", null, null, CancellationToken.None);
+        return result.Rows.ToDictionary(r => (string)r["k"]!, r => Convert.ToInt64(r["n"]));
+    }
+
+    [SkippableFact]
+    public async Task InsertRows_DoNothing_SkipsTakenKeys()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = await CreateKeyValueTableAsync();
+        try
+        {
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [
+                    new() { ["k"] = Json("a"), ["n"] = Json(10) },
+                    new() { ["k"] = Json("c"), ["n"] = Json(3) },
+                ],
+                onConflict: "do_nothing",
+                ct: CancellationToken.None);
+
+            Assert.Equal(1, inserted.Inserted);
+            Assert.Null(inserted.Returned);
+            Assert.Equal(new Dictionary<string, long> { ["a"] = 1, ["b"] = 2, ["c"] = 3 }, await ReadKeyValuesAsync(table));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task InsertRows_Upsert_UpdatesStoredRowsOnPrimaryKey()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = await CreateKeyValueTableAsync();
+        try
+        {
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [
+                    new() { ["k"] = Json("a"), ["n"] = Json(10) },
+                    new() { ["k"] = Json("d"), ["n"] = Json(4) },
+                ],
+                onConflict: "upsert",
+                ct: CancellationToken.None);
+
+            Assert.Equal(2, inserted.Inserted);
+            Assert.Equal(new Dictionary<string, long> { ["a"] = 10, ["b"] = 2, ["d"] = 4 }, await ReadKeyValuesAsync(table));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task InsertRows_UpsertOnUniqueColumn_ReturnsUpdatedRow()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" },
+                    new ColumnDefinition { Name = "email", Type = "string(100)", NotNull = true, Unique = true },
+                    new ColumnDefinition { Name = "name", Type = "string(100)" },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            InsertRowsResult first = await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [new() { ["email"] = Json("x@example.com"), ["name"] = Json("A") }],
+                returning: ["id"],
+                ct: CancellationToken.None);
+
+            InsertRowsResult second = await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [new() { ["email"] = Json("x@example.com"), ["name"] = Json("B") }],
+                onConflict: "upsert",
+                conflictColumns: ["email"],
+                returning: ["id", "name"],
+                ct: CancellationToken.None);
+
+            Assert.Equal(1, second.Inserted);
+            Dictionary<string, object?> row = Assert.Single(second.Returned!);
+            Assert.Equal("B", row["name"]);
+            Assert.Equal(Assert.Single(first.Returned!)["id"]?.ToString(), row["id"]?.ToString());
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task InsertRows_Returning_ReturnsGeneratedIds()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [
+                    new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" },
+                    new ColumnDefinition { Name = "name", Type = "string(100)" },
+                ],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(
+                Camus, Db, table,
+                [
+                    new() { ["name"] = Json("Alice") },
+                    new() { ["name"] = Json("Bob") },
+                ],
+                returning: ["*"],
+                ct: CancellationToken.None);
+
+            Assert.Equal(2, inserted.Inserted);
+            Assert.NotNull(inserted.Returned);
+            Assert.Equal(["Alice", "Bob"], inserted.Returned.Select(r => (string)r["name"]!));
+            Assert.All(inserted.Returned, r => Assert.False(string.IsNullOrEmpty(r["id"]?.ToString())));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task DiagnosticTools_RunAgainstServer()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = await CreateKeyValueTableAsync();
+        try
+        {
+            McpConfig config = _fx.Config;
+            CancellationToken ct = CancellationToken.None;
+
+            await CamusDbTools.GetStatementStats(Camus, config, "%FROM%", ct);
+            await CamusDbTools.GetSlowQueries(Camus, config, "it's %", ct);
+            await CamusDbTools.ListRunningQueries(Camus, config, null, cluster: false, ct);
+            await CamusDbTools.ListRunningQueries(Camus, config, "%x%", cluster: true, ct);
+            await CamusDbTools.ListConnections(Camus, config, cluster: false, ct);
+            await CamusDbTools.ListConnections(Camus, config, cluster: true, ct);
+            await CamusDbTools.ListExtensions(Camus, config, null, ct);
+            await CamusDbTools.ListExtensions(Camus, config, Db, ct);
+
+            GetEngineStatsResult engine = await CamusDbTools.GetEngineStats(Camus, config, null, ct);
+            Assert.NotEmpty(engine.Stats);
+
+            GetSettingsResult settings = await CamusDbTools.GetSettings(Camus, config, null, ct);
+            Assert.NotEmpty(settings.Variables);
+            GetSettingsResult filtered = await CamusDbTools.GetSettings(Camus, config, "slow_query%", ct);
+            Assert.All(filtered.Variables, r => Assert.StartsWith("slow_query", r["variable"]?.ToString()));
+
+            GetIndexUsageResult usage = await CamusDbTools.GetIndexUsage(Camus, config, Db, table, ct);
+            Assert.NotEmpty(usage.Indexes);
+            await CamusDbTools.GetIndexUsage(Camus, config, Db, null, ct);
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
+    public async Task ExplainQuery_PlansLockingReadWithoutLocking()
+    {
+        _fx.SkipIfUnavailable();
+
+        string table = UniqueTableName();
+        try
+        {
+            await CamusDbTools.CreateTable(
+                Camus, Db, table,
+                [new ColumnDefinition { Name = "id", Type = "oid", Primary = true, Default = "gen_id()" }],
+                ifNotExists: false,
+                CancellationToken.None);
+
+            ExplainQueryResult plan = await CamusDbTools.ExplainQuery(
+                Camus, Db, $"SELECT id FROM {table} FOR UPDATE SKIP LOCKED", null, CancellationToken.None);
+
+            IEnumerable<string> cells = plan.Plan
+                .SelectMany(row => row.Values)
+                .Select(v => v?.ToString() ?? "");
+            Assert.Contains(cells, c => c.Contains("lock_rows", StringComparison.OrdinalIgnoreCase));
+
+            await Assert.ThrowsAsync<CamusDB.Client.CamusException>(() => CamusDbTools.ExplainQuery(
+                Camus, Db, $"SELECT id FROM {table} FOR UPDATE", "analyze", CancellationToken.None));
+        }
+        finally
+        {
+            await DropTableAsync(table);
+        }
+    }
+
+    [SkippableFact]
     public async Task CreateTable_NonUniqueIndex_CreatesSecondaryIndex()
     {
         _fx.SkipIfUnavailable();
@@ -285,7 +557,7 @@ public sealed class TestCamusDbToolsIntegration
                 new() { ["id"] = Json(3), ["amount"] = Json(42) },
             ];
 
-            InsertRowsResult inserted = await CamusDbTools.InsertRows(Camus, Db, table, rows, CancellationToken.None);
+            InsertRowsResult inserted = await CamusDbTools.InsertRows(Camus, Db, table, rows, ct: CancellationToken.None);
             Assert.Equal(3, inserted.Inserted);
 
             SelectQueryResult selected = await CamusDbTools.SelectQuery(
@@ -322,7 +594,7 @@ public sealed class TestCamusDbToolsIntegration
                 new() { ["id"] = Json(2), ["tags"] = Json(Array.Empty<string>()) },
                 new() { ["id"] = Json(3), ["tags"] = Json(new[] { "c" }) },
             ];
-            await CamusDbTools.InsertRows(Camus, Db, table, rows, CancellationToken.None);
+            await CamusDbTools.InsertRows(Camus, Db, table, rows, ct: CancellationToken.None);
 
             SelectQueryResult selected = await CamusDbTools.SelectQuery(
                 Camus, _fx.Config, Db, $"SELECT id, tags FROM {table} WHERE id = ANY(@ids) ORDER BY id",

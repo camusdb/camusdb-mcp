@@ -74,6 +74,76 @@ public sealed class TestStatementGuard
     }
 
     [Fact]
+    public void AssertReadOnly_AllowsSetOperations()
+    {
+        StatementGuard.AssertReadOnly("SELECT a FROM t UNION ALL SELECT b FROM u");
+        StatementGuard.AssertReadOnly("(SELECT a FROM t ORDER BY a LIMIT 5) UNION ALL SELECT b FROM u ORDER BY 1");
+        StatementGuard.AssertReadOnly("/* both */ ( ( SELECT a FROM t) INTERSECT SELECT b FROM u)");
+    }
+
+    [Fact]
+    public void AssertReadOnly_RejectsWriteBehindParenthesis()
+    {
+        CamusException ex = Assert.Throws<CamusException>(() =>
+            StatementGuard.AssertReadOnly("(DELETE FROM users)"));
+        Assert.Contains("select_query only accepts SELECT, SHOW and DESCRIBE", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("SELECT id FROM jobs WHERE state = 'ready' FOR UPDATE")]
+    [InlineData("SELECT id FROM jobs LIMIT 10 FOR UPDATE SKIP LOCKED")]
+    [InlineData("select id from jobs for no key update nowait")]
+    [InlineData("SELECT id FROM jobs FOR UPDATE OF jobs")]
+    [InlineData("SELECT id FROM jobs FOR SHARE")]
+    [InlineData("SELECT id FROM jobs FOR KEY SHARE")]
+    [InlineData("SELECT id FROM jobs FOR/**/UPDATE")]
+    [InlineData("SELECT id FROM jobs FOR\n  UPDATE")]
+    public void AssertReadOnly_RejectsLockingReads(string sql)
+    {
+        CamusException ex = Assert.Throws<CamusException>(() => StatementGuard.AssertReadOnly(sql));
+        Assert.Equal("CADB0400", ex.Code);
+        Assert.Contains("row-locking", ex.Message);
+    }
+
+    [Fact]
+    public void AssertReadOnly_AllowsLookalikeLockingWords()
+    {
+        StatementGuard.AssertReadOnly("SELECT for_update FROM t");
+        StatementGuard.AssertReadOnly("SELECT updated FROM t");
+        StatementGuard.AssertReadOnly("SHOW STATISTICS FOR TABLE users");
+        StatementGuard.AssertReadOnly("SHOW GRANTS FOR alice");
+    }
+
+    [Fact]
+    public void AssertExplain_AllowsLockingReadInPlanModes()
+    {
+        Assert.Equal("SELECT", StatementGuard.AssertExplain("SELECT id FROM jobs FOR UPDATE"));
+        Assert.Equal("SELECT", StatementGuard.AssertExplain("SELECT id FROM jobs FOR UPDATE", "physical"));
+        Assert.Equal("EXPLAIN", StatementGuard.AssertExplain("EXPLAIN SELECT id FROM jobs FOR UPDATE SKIP LOCKED"));
+        Assert.Equal("EXPLAIN", StatementGuard.AssertExplain("EXPLAIN (LOGICAL) SELECT id FROM jobs FOR UPDATE"));
+    }
+
+    [Theory]
+    [InlineData("SELECT id FROM jobs FOR UPDATE", "analyze")]
+    [InlineData("SELECT id FROM jobs FOR UPDATE", "ANALYZE")]
+    [InlineData("EXPLAIN (ANALYZE) SELECT id FROM jobs FOR UPDATE", null)]
+    [InlineData("explain ( analyze ) select id from jobs for update nowait", "plan")]
+    [InlineData("EXPLAIN (/**/ANALYZE) SELECT id FROM jobs FOR UPDATE", null)]
+    public void AssertExplain_RejectsLockingReadUnderAnalyze(string sql, string? mode)
+    {
+        CamusException ex = Assert.Throws<CamusException>(() => StatementGuard.AssertExplain(sql, mode));
+        Assert.Equal("CADB0400", ex.Code);
+        Assert.Contains("row-locking", ex.Message);
+    }
+
+    [Fact]
+    public void AssertExplain_AllowsAnalyzeOfPlainSelect()
+    {
+        Assert.Equal("SELECT", StatementGuard.AssertExplain("SELECT id FROM jobs", "analyze"));
+        Assert.Equal("EXPLAIN", StatementGuard.AssertExplain("EXPLAIN (ANALYZE) SELECT id FROM jobs"));
+    }
+
+    [Fact]
     public void AssertExplain_RejectsSequenceWrites()
     {
         Assert.Throws<CamusException>(() => StatementGuard.AssertExplain("EXPLAIN SELECT nextval('order_seq')"));

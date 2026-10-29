@@ -215,16 +215,33 @@ Or launching via the SDK without pre-building:
 | `show_create`      | Get the DDL that recreates a table, view, materialized view or sequence (via `SHOW CREATE …`). Tables can omit secondary indexes. |
 | `get_table_statistics` | Get the optimizer statistics for a table (via `SHOW STATISTICS FOR TABLE`).             |
 
-Every other `SHOW` statement (`SHOW GRANTS`, `SHOW USERS`, `SHOW VARIABLES`, `SHOW CLUSTER SETTINGS`,
-`SHOW ENGINE STATS`, `SHOW SLOW QUERIES`, `SHOW RANGES`, `SHOW ORPHAN TABLES`, `SHOW DATABASE`, the
-`LIKE` filters, …) is available through `select_query`. Result rows pass through unchanged, so a
+### Diagnostic tools (read-only)
+
+These tools wrap the server's observability statements. The optional `like` input is sent as a
+quoted SQL literal. Each result is capped at `max_rows` and reports `truncated`. Most of these
+statements require a **superuser** when authentication is enabled, and most report only the node
+that answers.
+
+| Tool                   | Description                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------ |
+| `get_statement_stats`  | Per-shape statement statistics (`SHOW STATEMENT STATS [LIKE]`). Off by default: turn it on with `statement_stats_enabled`. |
+| `get_slow_queries`     | The slow query log, newest first (`SHOW SLOW QUERIES [LIKE]`). Off by default: turn it on with `slow_query_log_enabled`. |
+| `get_index_usage`      | Read and write counters for each index of a database or a table (`SHOW INDEX USAGE [FROM t]`). |
+| `list_running_queries` | Statements that run now (`SHOW [CLUSTER] QUERIES [LIKE]`). A non-superuser sees only their own. |
+| `list_connections`     | Open client and peer connections (`SHOW [CLUSTER] CONNECTIONS`).                     |
+| `get_engine_stats`     | Engine counters and latency distributions (`SHOW ENGINE STATS [LIKE]`).              |
+| `get_settings`         | The node's effective configuration (`SHOW VARIABLES [LIKE]`) and the cluster overrides (`SHOW CLUSTER SETTINGS [LIKE]`). |
+| `list_extensions`      | The C# extension builds the node loaded, with their status for a database (`SHOW EXTENSIONS`). |
+
+Every other `SHOW` statement (`SHOW GRANTS`, `SHOW USERS`, `SHOW RANGES`, `SHOW ORPHAN TABLES`,
+`SHOW DATABASE`, …) is available through `select_query`. Result rows pass through unchanged, so a
 column the server adds to a `SHOW` result reaches the client without a change here.
 
 ### Query tools (read-only, enforced by the statement guard)
 
 | Tool            | Description                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------- |
-| `select_query`  | Execute a SELECT, SHOW or DESCRIBE statement. Mutating SQL is rejected before execution. Capped at `max_rows`. |
+| `select_query`  | Execute a SELECT, SHOW or DESCRIBE statement. Mutating SQL and `FOR UPDATE` reads are rejected before execution. Capped at `max_rows`. |
 | `explain_query` | Execute an EXPLAIN statement (plan / logical / physical / analyze). Bare SELECT is prefixed with EXPLAIN. |
 
 #### Parameters and result values
@@ -250,6 +267,23 @@ In results, a `NUMERIC` value is returned as its exact decimal text (`"1.5"`, `"
 | `create_table`    | Create a table from a typed column definition list. Identifiers and types are validated.   |
 | `insert_rows`     | Insert one or more rows. Values are passed as parameters (no string interpolation), chunked at 500 rows/batch. |
 
+`insert_rows` takes three optional inputs:
+
+- `onConflict` sets what happens to a row whose unique key is already taken:
+  - `error` (the default) fails the chunk.
+  - `do_nothing` skips the row (`INSERT … ON CONFLICT DO NOTHING`).
+  - `upsert` updates the stored row with the values of the row. Without `conflictColumns` it sends
+    `UPSERT INTO`, which uses the primary key. With `conflictColumns` it sends
+    `ON CONFLICT (cols) DO UPDATE SET c = excluded.c` for each other inserted column. `upsert`
+    needs the `UPDATE` privilege as well as `INSERT`. A key must appear only once in a chunk.
+- `conflictColumns` names the columns of the unique index that decides a conflict (the arbiter).
+- `returning` lists the columns to read back from each written row, or `["*"]`. The values are the
+  stored values, so they include `gen_id()`, sequence and serial values. The rows come back in
+  `returned`. This needs the `SELECT` privilege.
+
+The `inserted` count is the number of rows written: inserted rows plus updated rows. Skipped rows
+are not counted. Each chunk of 500 rows commits on its own.
+
 ## Read-only vs. mutating boundary
 
 `select_query` and `explain_query` classify the SQL **locally** before any statement reaches the
@@ -257,7 +291,8 @@ server. The classifier (`StatementGuard`) is self-contained — it does not embe
 
 1. It strips SQL comments first — both line comments (`-- … end-of-line`) and block comments
    (`/* … */`, including across newlines) — so a leading comment cannot hide the real first
-   keyword. Block comments are removed before line comments.
+   keyword. Block comments are removed before line comments. Leading parentheses are skipped too,
+   so a set operation such as `(SELECT …) UNION ALL SELECT …` classifies as `SELECT`.
 2. It then reads the **maximal leading identifier** and matches it case-insensitively against an
    allow-list: `SELECT`/`SHOW`/`DESCRIBE`/`DESC` for `select_query`, `EXPLAIN`/`SELECT` for
    `explain_query`. Matching the whole identifier means `SELECTED` or `SHOWROOM` never false-match.
@@ -266,6 +301,13 @@ server. The classifier (`StatementGuard`) is self-contained — it does not embe
    search runs on the raw text and on the comment-stripped text, so neither a comment nor a
    comment-like string literal can hide the call. `currval` and `lastval` only read, so they are
    allowed.
+4. It rejects a row-locking read (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`,
+   `FOR KEY SHARE`) where the statement would run. The server runs such a read in its own
+   read-write transaction, takes exclusive row locks and requires the `UPDATE` privilege. In
+   autocommit the locks end with the statement, so the read gives no protection and only blocks
+   concurrent writers. `select_query` always rejects it. `explain_query` accepts it in the plan
+   modes, which take no lock, and rejects it under `analyze`. The search runs on the raw text and
+   on the comment-stripped text, as in step 3.
 
 Anything else (INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, RENAME, …) is rejected with a
 `CamusException` (code `CADB0400`) **before** execution. This is the hard security boundary and is
